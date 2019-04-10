@@ -772,10 +772,10 @@ def optimize_layout(
         # head is locally ascending per node
         n_edges = head.shape[0]
 
-        threadsperblock = 32
+        threads_per_block = 32
         #TODO does this really make sense?
-        blockspergrid = 4096 // threadsperblock
-        n_threads = blockspergrid * threads_per_block
+        blocks_per_grid = 4096 // threads_per_block
+        n_threads = blocks_per_grid * threads_per_block
         
         move_other = head_embedding.shape[0] == tail_embedding.shape[0]
         
@@ -786,19 +786,19 @@ def optimize_layout(
         else:
             d_tail_embedding = d_head_embedding
         
-        d_adjacency_indices = cuda.to_device(adjacency_indices)
-        d_adjacency = cuda.to_device(tail)
+        d_head = cuda.to_device(head)
+        d_tail = cuda.to_device(tail)
         d_epochs_per_sample = cuda.to_device(epochs_per_sample)
         d_epoch_of_next_sample = cuda.to_device(epochs_per_sample)
-        d_rng_states = create_xoroshiro128p_states(n_threads,seed=rng_state)
+        d_rng_states = create_xoroshiro128p_states(n_threads,seed=rng_state[0])
 
         for n in range(n_epochs):
             alpha = initial_alpha * (1.0 - (float(n) / float(n_epochs)))
-            optimize_layout_cuda[blockspergrid, threadsperblock](
+            optimize_layout_cuda[blocks_per_grid, threads_per_block](
                 d_head_embedding,
                 d_tail_embedding,
-                d_adjacency_indices,
-                d_adjacency,
+                d_head,
+                d_tail,
                 n,
                 d_epochs_per_sample,
                 d_epoch_of_next_sample,

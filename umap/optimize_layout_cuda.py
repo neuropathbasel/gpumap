@@ -50,7 +50,7 @@ def rdist(x, y):
     return result
 
 
-@cuda.jit(fastmath=True, parallel=True)
+@cuda.jit
 def optimize_layout_cuda(
     write_embedding,
     read_embedding,
