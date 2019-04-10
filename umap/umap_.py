@@ -17,6 +17,8 @@ import numpy as np
 import scipy.sparse
 import scipy.sparse.csgraph
 import numba
+from numba import cuda
+from numba.cuda.random import create_xoroshiro128p_states
 
 import umap.distances as dist
 
@@ -31,6 +33,7 @@ from umap.nndescent import (
     initialise_search,
 )
 from umap.spectral import spectral_layout
+from umap.optimize_layout_cuda import optimize_layout_cuda
 
 import locale
 
@@ -679,7 +682,6 @@ def rdist(x, y):
     return result
 
 
-@numba.njit(fastmath=True, parallel=True)
 def optimize_layout(
     head_embedding,
     tail_embedding,
@@ -694,7 +696,158 @@ def optimize_layout(
     gamma=1.0,
     initial_alpha=1.0,
     negative_sample_rate=5.0,
-    verbose=False,
+    verbose=True, #TODO set back to False
+):
+    """Improve an embedding using stochastic gradient descent to minimize the
+    fuzzy set cross entropy between the 1-skeletons of the high dimensional
+    and low dimensional fuzzy simplicial sets. In practice this is done by
+    sampling edges based on their membership strength (with the (1-p) terms
+    coming from negative sampling similar to word2vec).
+
+    Parameters
+    ----------
+    head_embedding: array of shape (n_samples, n_components)
+        The initial embedding to be improved by SGD.
+
+    tail_embedding: array of shape (source_samples, n_components)
+        The reference embedding of embedded points. If not embedding new
+        previously unseen points with respect to an existing embedding this
+        is simply the head_embedding (again); otherwise it provides the
+        existing embedding to embed with respect to.
+
+    head: array of shape (n_1_simplices)
+        The indices of the heads of 1-simplices with non-zero membership.
+
+    tail: array of shape (n_1_simplices)
+        The indices of the tails of 1-simplices with non-zero membership.
+
+    n_epochs: int
+        The number of training epochs to use in optimization.
+
+    n_vertices: int
+        The number of vertices (0-simplices) in the dataset.
+
+    epochs_per_samples: array of shape (n_1_simplices)
+        A float value of the number of epochs per 1-simplex. 1-simplices with
+        weaker membership strength will have more epochs between being sampled.
+
+    a: float
+        Parameter of differentiable approximation of right adjoint functor
+
+    b: float
+        Parameter of differentiable approximation of right adjoint functor
+
+    rng_state: array of int64, shape (3,)
+        The internal state of the rng
+
+    gamma: float (optional, default 1.0)
+        Weight to apply to negative samples.
+
+    initial_alpha: float (optional, default 1.0)
+        Initial learning rate for the SGD.
+
+    negative_sample_rate: int (optional, default 5)
+        Number of negative samples to use per positive sample.
+
+    verbose: bool (optional, default False)
+        Whether to report information on the current progress of the algorithm.
+
+    Returns
+    -------
+    embedding: array of shape (n_samples, n_components)
+        The optimized embedding.
+    """
+    cuda_available = cuda.is_available()
+    
+    if cuda_available:
+        if verbose:
+            print("using CUDA")
+        
+        if negative_sample_rate != int(negative_sample_rate):
+            negative_sample_rate = int(negative_sample_rate)
+            if verbose:
+                print("rounding negative sample rate to ", negative_sample_rate)
+
+        # tail is sorted ascending over all nodes
+        # head is locally ascending per node
+        n_edges = head.shape[0]
+
+        threadsperblock = 32
+        #TODO does this really make sense?
+        blockspergrid = 4096 // threadsperblock
+        n_threads = blockspergrid * threads_per_block
+        
+        move_other = head_embedding.shape[0] == tail_embedding.shape[0]
+        
+        # copy arrays to device
+        d_head_embedding = cuda.to_device(head_embedding)
+        if move_other:
+            d_tail_embedding = cuda.to_device(tail_embedding)
+        else:
+            d_tail_embedding = d_head_embedding
+        
+        d_adjacency_indices = cuda.to_device(adjacency_indices)
+        d_adjacency = cuda.to_device(tail)
+        d_epochs_per_sample = cuda.to_device(epochs_per_sample)
+        d_epoch_of_next_sample = cuda.to_device(epochs_per_sample)
+        d_rng_states = create_xoroshiro128p_states(n_threads,seed=rng_state)
+
+        for n in range(n_epochs):
+            alpha = initial_alpha * (1.0 - (float(n) / float(n_epochs)))
+            optimize_layout_cuda[blockspergrid, threadsperblock](
+                d_head_embedding,
+                d_tail_embedding,
+                d_adjacency_indices,
+                d_adjacency,
+                n,
+                d_epochs_per_sample,
+                d_epoch_of_next_sample,
+                a,
+                b,
+                d_rng_states,
+                gamma,
+                alpha,
+                negative_sample_rate,
+            )
+        
+        # copy arrays back from device
+        head_embedding = d_head_embedding.copy_to_host()
+        
+        return head_embedding
+    else:
+        return optimize_layout_cpu(
+            head_embedding,
+            tail_embedding,
+            head,
+            tail,
+            n_epochs,
+            n_vertices,
+            epochs_per_sample,
+            a,
+            b,
+            rng_state,
+            gamma,
+            initial_alpha,
+            negative_sample_rate,
+            verbose,
+        )
+
+@numba.njit(fastmath=True, parallel=True)
+def optimize_layout_cpu(
+    head_embedding,
+    tail_embedding,
+    head,
+    tail,
+    n_epochs,
+    n_vertices,
+    epochs_per_sample,
+    a,
+    b,
+    rng_state,
+    gamma,
+    initial_alpha,
+    negative_sample_rate,
+    verbose,
 ):
     """Improve an embedding using stochastic gradient descent to minimize the
     fuzzy set cross entropy between the 1-skeletons of the high dimensional
@@ -762,6 +915,7 @@ def optimize_layout(
 
     epochs_per_negative_sample = epochs_per_sample / negative_sample_rate
     epoch_of_next_negative_sample = epochs_per_negative_sample.copy()
+    #remainder = np.zeros(epochs_per_sample.shape[0], dtype=np.float64)
     epoch_of_next_sample = epochs_per_sample.copy()
 
     for n in range(n_epochs):
@@ -793,6 +947,9 @@ def optimize_layout(
                     (n - epoch_of_next_negative_sample[i])
                     / epochs_per_negative_sample[i]
                 )
+#                n_neg_samples_float = negative_sample_rate + remainder[i]
+#                n_neg_samples = int(n_neg_samples_float)
+#                remainder[i] = n_neg_samples_float - n_neg_samples
 
                 for p in range(n_neg_samples):
                     k = tau_rand_int(rng_state) % n_vertices
@@ -817,11 +974,10 @@ def optimize_layout(
                         else:
                             grad_d = 4.0
                         current[d] += grad_d * alpha
-
+                        
                 epoch_of_next_negative_sample[i] += (
                     n_neg_samples * epochs_per_negative_sample[i]
                 )
-
         alpha = initial_alpha * (1.0 - (float(n) / float(n_epochs)))
 
         if verbose and n % int(n_epochs / 10) == 0:
@@ -969,7 +1125,7 @@ def simplicial_set_embedding(
     tail = graph.col
 
     rng_state = random_state.randint(INT32_MIN, INT32_MAX, 3).astype(np.int64)
-    embedding = optimize_layout(
+    return (
         embedding,
         embedding,
         head,
@@ -983,11 +1139,8 @@ def simplicial_set_embedding(
         gamma,
         initial_alpha,
         negative_sample_rate,
-        verbose=verbose,
+        verbose,
     )
-
-    return embedding
-
 
 @numba.njit()
 def init_transform(indices, weights, embedding):
@@ -1526,8 +1679,10 @@ class UMAP(BaseEstimator):
 
         if self.verbose:
             print("Construct embedding")
+        
+        self._input_hash = joblib.hash(self._raw_data)
 
-        self.embedding_ = simplicial_set_embedding(
+        return simplicial_set_embedding(
             self._raw_data,
             self.graph_,
             self.n_components,
@@ -1544,7 +1699,23 @@ class UMAP(BaseEstimator):
             self.verbose,
         )
 
-        self._input_hash = joblib.hash(self._raw_data)
+    def fit_2(self, pre_embedding):
+        self.embedding_ = optimize_layout(
+            pre_embedding[0],
+            pre_embedding[1],
+            pre_embedding[2],
+            pre_embedding[3],
+            pre_embedding[4],
+            pre_embedding[5],
+            pre_embedding[6],
+            pre_embedding[7],
+            pre_embedding[8],
+            pre_embedding[9],
+            pre_embedding[10],
+            pre_embedding[11],
+            pre_embedding[12],
+            pre_embedding[13],
+        )
 
         return self
 
@@ -1569,7 +1740,8 @@ class UMAP(BaseEstimator):
         X_new : array, shape (n_samples, n_components)
             Embedding of the training data in low-dimensional space.
         """
-        self.fit(X, y)
+        pre_embed = self.fit(X, y)
+        self.fit_2(pre_embed)
         return self.embedding_
 
     def transform(self, X):
