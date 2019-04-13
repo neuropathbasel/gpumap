@@ -697,6 +697,7 @@ def optimize_layout(
     initial_alpha=1.0,
     negative_sample_rate=5.0,
     verbose=True, #TODO set back to False
+    use_cuda=True
 ):
     """Improve an embedding using stochastic gradient descent to minimize the
     fuzzy set cross entropy between the 1-skeletons of the high dimensional
@@ -759,78 +760,30 @@ def optimize_layout(
     """
     cuda_available = cuda.is_available()
     
-    if cuda_available:
-        if verbose:
+    if cuda_available == use_cuda:
+        if True: #TODO verbose:
             print("using CUDA")
-        
-        if negative_sample_rate != int(negative_sample_rate):
-            negative_sample_rate = int(negative_sample_rate)
-            if verbose:
-                print("rounding negative sample rate to ", negative_sample_rate)
-
-        # tail is sorted ascending over all nodes
-        # head is locally ascending per node
-        n_edges = head.shape[0]
-
-        threads_per_block = 32
-        #TODO does this really make sense?
-        blocks_per_grid = 4096 // threads_per_block
-        n_threads = blocks_per_grid * threads_per_block
-        
-        move_other = head_embedding.shape[0] == tail_embedding.shape[0]
-        
-        # copy arrays to device
-        d_head_embedding = cuda.to_device(head_embedding)
-        if move_other:
-            d_tail_embedding = cuda.to_device(tail_embedding)
-        else:
-            d_tail_embedding = d_head_embedding
-        
-        d_head = cuda.to_device(head)
-        d_tail = cuda.to_device(tail)
-        d_epochs_per_sample = cuda.to_device(epochs_per_sample)
-        d_epoch_of_next_sample = cuda.to_device(epochs_per_sample)
-        d_rng_states = create_xoroshiro128p_states(n_threads,seed=rng_state[0])
-
-        for n in range(n_epochs):
-            alpha = initial_alpha * (1.0 - (float(n) / float(n_epochs)))
-            optimize_layout_cuda[blocks_per_grid, threads_per_block](
-                d_head_embedding,
-                d_tail_embedding,
-                d_head,
-                d_tail,
-                n,
-                d_epochs_per_sample,
-                d_epoch_of_next_sample,
-                a,
-                b,
-                d_rng_states,
-                gamma,
-                alpha,
-                negative_sample_rate,
-            )
-        
-        # copy arrays back from device
-        head_embedding = d_head_embedding.copy_to_host()
-        
-        return head_embedding
+        optimize_func = optimize_layout_gpu
     else:
-        return optimize_layout_cpu(
-            head_embedding,
-            tail_embedding,
-            head,
-            tail,
-            n_epochs,
-            n_vertices,
-            epochs_per_sample,
-            a,
-            b,
-            rng_state,
-            gamma,
-            initial_alpha,
-            negative_sample_rate,
-            verbose,
-        )
+        optimize_func = optimize_layout_cpu
+    
+    return optimize_func(
+        head_embedding,
+        tail_embedding,
+        head,
+        tail,
+        n_epochs,
+        n_vertices,
+        epochs_per_sample,
+        a,
+        b,
+        rng_state,
+        gamma,
+        initial_alpha,
+        negative_sample_rate,
+        verbose,
+    )
+
 
 @numba.njit(fastmath=True, parallel=True)
 def optimize_layout_cpu(
@@ -985,6 +938,75 @@ def optimize_layout_cpu(
 
     return head_embedding
 
+
+def optimize_layout_gpu(
+    head_embedding,
+    tail_embedding,
+    head,
+    tail,
+    n_epochs,
+    n_vertices,
+    epochs_per_sample,
+    a,
+    b,
+    rng_state,
+    gamma,
+    initial_alpha,
+    negative_sample_rate,
+    verbose,
+):
+    if negative_sample_rate != int(negative_sample_rate):
+        negative_sample_rate = int(negative_sample_rate)
+        if verbose:
+            print("rounding negative sample rate to ", negative_sample_rate)
+
+    # tail is sorted ascending over all nodes
+    # head is locally ascending per node
+    n_edges = head.shape[0]
+
+    threads_per_block = 32
+    #TODO does this really make sense?
+    blocks_per_grid = 4096 // threads_per_block
+    n_threads = blocks_per_grid * threads_per_block
+    
+    move_other = head_embedding.shape[0] == tail_embedding.shape[0]
+    
+    # copy arrays to device
+    d_head_embedding = cuda.to_device(head_embedding)
+    if move_other:
+        d_tail_embedding = cuda.to_device(tail_embedding)
+    else:
+        d_tail_embedding = d_head_embedding
+    
+    d_head = cuda.to_device(head)
+    d_tail = cuda.to_device(tail)
+    d_epochs_per_sample = cuda.to_device(epochs_per_sample)
+    d_epoch_of_next_sample = cuda.to_device(epochs_per_sample)
+    d_rng_states = create_xoroshiro128p_states(n_threads,seed=rng_state[0])
+
+    for n in range(n_epochs):
+        alpha = initial_alpha * (1.0 - (float(n) / float(n_epochs)))
+        optimize_layout_cuda[blocks_per_grid, threads_per_block](
+            d_head_embedding,
+            d_tail_embedding,
+            d_head,
+            d_tail,
+            n,
+            d_epochs_per_sample,
+            d_epoch_of_next_sample,
+            a,
+            b,
+            d_rng_states,
+            gamma,
+            alpha,
+            negative_sample_rate,
+        )
+    
+    # copy arrays back from device
+    head_embedding = d_head_embedding.copy_to_host()
+    
+    return head_embedding
+        
 
 def simplicial_set_embedding(
     data,
@@ -1699,7 +1721,8 @@ class UMAP(BaseEstimator):
             self.verbose,
         )
 
-    def fit_2(self, pre_embedding):
+
+    def fit_2(self, pre_embedding, use_cuda=True):
         self.embedding_ = optimize_layout(
             pre_embedding[0],
             pre_embedding[1],
@@ -1715,6 +1738,7 @@ class UMAP(BaseEstimator):
             pre_embedding[11],
             pre_embedding[12],
             pre_embedding[13],
+            use_cuda
         )
 
         return self

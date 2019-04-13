@@ -9,26 +9,10 @@ from math import pow
 from numba import cuda
 from numba.cuda.random import xoroshiro128p_uniform_float32
 
-from umap.utils import tau_rand_int
-
 import locale
 
 locale.setlocale(locale.LC_NUMERIC, "C")
 
-@cuda.jit(device=True)
-def calculate_position():
-    # Thread id in a 1D block
-    tx = cuda.threadIdx.x
-    # Block id in a 1D grid
-    ty = cuda.blockIdx.x
-    # Block width, i.e. number of threads per block
-    bw = cuda.blockDim.x
-    # Compute flattened index inside the array
-    pos = tx + ty * bw
-    
-    return (pos, bw * cuda.gridDim)
-
-#@numba.njit("f4(f4[:],f4[:])", fastmath=True)
 @cuda.jit(device=True)
 def rdist(x, y):
     """Reduced Euclidean distance.
@@ -56,12 +40,12 @@ def optimize_layout_cuda(
     read_embedding,
     head,
     tail,
-    n_epochs,
+    epoch,
     epochs_per_sample,
     epoch_of_next_sample,
     a,
     b,
-    rng_state,
+    rng_states,
     gamma,
     alpha,
     negative_sample_rate,
@@ -123,15 +107,16 @@ def optimize_layout_cuda(
     embedding: array of shape (n_samples, n_components)
         The optimized embedding.
     """
-    thread_id, n_threads = calculate_position()
-    n_edges = head.shape[0]
+    thread_id = cuda.grid(1)
+    n_threads = cuda.gridsize(1)
     n_dims = write_embedding.shape[1]
     n_vertices = read_embedding.shape[0]
+    n_edges = head.shape[0]
 
     # edges handled by this thread
-    thread_size = n_edges / n_threads
-    edge_start = int(thread_id * thread_size)
-    edge_end = min(int((thread_id + 1) * thread_size), n_edges)
+    thread_size = ceil(n_edges / n_threads)
+    edge_start = thread_id * thread_size
+    edge_end = min((thread_id + 1) * thread_size, n_edges)
 
     # for n in range(n_epochs): handled by caller
     for edge in range(edge_start, edge_end):
@@ -151,15 +136,13 @@ def optimize_layout_cuda(
                 grad_coeff = 0.0
 
             for d in range(n_dims):
-                grad_d = max(min(grad_coeff * (current[d] - other[d]),4),-4)
+                grad_d = max(min(grad_coeff * (current[d] - other[d]),4.0),-4.0)
                 current[d] += grad_d * alpha
 
             epoch_of_next_sample[i] += epochs_per_sample[i]
 
-            for p in range(neg_sample_rate):
-                # TODO random, not i not j
-                k = int(xoroshiro128p_uniform_float32(rng_states, thread_id))
-                k = tau_rand_int(rng_state) % n_vertices
+            for p in range(negative_sample_rate):
+                k = int(xoroshiro128p_uniform_float32(rng_states, thread_id)) % n_vertices
 
                 other = read_embedding[k]
 
@@ -168,24 +151,17 @@ def optimize_layout_cuda(
                 if dist_squared > 0.0:
                     grad_coeff = 2.0 * gamma * b
                     grad_coeff /= (0.001 + dist_squared) * (
-                        a * pow(dist_squared, b) + 1
+                        a * pow(dist_squared, b) + 1.0
                     )
+                elif k==j:
+                    continue
                 else:
                     grad_coeff = 0.0
 
                 for d in range(n_dims):
                     if grad_coeff > 0.0:
-                        grad_d = max(min(grad_coeff * (current[d] - other[d]),4),-4)
+                        grad_d = max(min(grad_coeff * (current[d] - other[d]),4.0),-4.0)
                     else:
                         grad_d = 4.0
                     current[d] += grad_d * alpha
-
-
-
-
-
-
-
-
-
 
