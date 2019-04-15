@@ -20,6 +20,8 @@ import numba
 from numba import cuda
 from numba.cuda.random import create_xoroshiro128p_states
 
+import time
+
 import umap.distances as dist
 
 import umap.sparse as sparse
@@ -695,7 +697,7 @@ def optimize_layout(
     rng_state,
     gamma=1.0,
     initial_alpha=1.0,
-    negative_sample_rate=5.0,
+    negative_sample_rate=5,
     verbose=True, #TODO set back to False
     use_cuda=True
 ):
@@ -868,7 +870,6 @@ def optimize_layout_cpu(
 
     epochs_per_negative_sample = epochs_per_sample / negative_sample_rate
     epoch_of_next_negative_sample = epochs_per_negative_sample.copy()
-    #remainder = np.zeros(epochs_per_sample.shape[0], dtype=np.float64)
     epoch_of_next_sample = epochs_per_sample.copy()
 
     for n in range(n_epochs):
@@ -896,15 +897,7 @@ def optimize_layout_cpu(
 
                 epoch_of_next_sample[i] += epochs_per_sample[i]
 
-                n_neg_samples = int(
-                    (n - epoch_of_next_negative_sample[i])
-                    / epochs_per_negative_sample[i]
-                )
-#                n_neg_samples_float = negative_sample_rate + remainder[i]
-#                n_neg_samples = int(n_neg_samples_float)
-#                remainder[i] = n_neg_samples_float - n_neg_samples
-
-                for p in range(n_neg_samples):
+                for p in range(int(negative_sample_rate)):
                     k = tau_rand_int(rng_state) % n_vertices
 
                     other = tail_embedding[k]
@@ -928,9 +921,6 @@ def optimize_layout_cpu(
                             grad_d = 4.0
                         current[d] += grad_d * alpha
                         
-                epoch_of_next_negative_sample[i] += (
-                    n_neg_samples * epochs_per_negative_sample[i]
-                )
         alpha = initial_alpha * (1.0 - (float(n) / float(n_epochs)))
 
         if verbose and n % int(n_epochs / 10) == 0:
@@ -955,10 +945,12 @@ def optimize_layout_gpu(
     negative_sample_rate,
     verbose,
 ):
-    if negative_sample_rate != int(negative_sample_rate):
-        negative_sample_rate = int(negative_sample_rate)
-        if verbose:
-            print("rounding negative sample rate to ", negative_sample_rate)
+    if True: # verbose
+        print("### init gpu")
+        start = time.time()
+    if verbose and negative_sample_rate != int(negative_sample_rate):
+        print("rounding negative sample rate to ", int(negative_sample_rate))
+    negative_sample_rate = int(negative_sample_rate)
 
     # tail is sorted ascending over all nodes
     # head is locally ascending per node
@@ -984,8 +976,23 @@ def optimize_layout_gpu(
     d_epoch_of_next_sample = cuda.to_device(epochs_per_sample)
     d_rng_states = create_xoroshiro128p_states(n_threads,seed=rng_state[0])
 
+    d_various_floats = cuda.to_device((
+        a,
+        b,
+        gamma,
+        initial_alpha
+    ))
+    d_various_ints = cuda.to_device((
+        n_epochs,
+        negative_sample_rate
+    ))
+    
+    if True: #verbose
+        end = time.time()
+        print("### end init gpu")
+        print(end - start)
+
     for n in range(n_epochs):
-        alpha = initial_alpha * (1.0 - (float(n) / float(n_epochs)))
         optimize_layout_cuda[blocks_per_grid, threads_per_block](
             d_head_embedding,
             d_tail_embedding,
@@ -994,12 +1001,9 @@ def optimize_layout_gpu(
             n,
             d_epochs_per_sample,
             d_epoch_of_next_sample,
-            a,
-            b,
+            d_various_floats,
+            d_various_ints,
             d_rng_states,
-            gamma,
-            alpha,
-            negative_sample_rate,
         )
     
     # copy arrays back from device

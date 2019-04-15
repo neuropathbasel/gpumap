@@ -4,7 +4,7 @@
 from __future__ import print_function
 from warnings import warn
 
-from math import pow
+from math import pow, ceil
 
 from numba import cuda
 from numba.cuda.random import xoroshiro128p_uniform_float32
@@ -13,7 +13,24 @@ import locale
 
 locale.setlocale(locale.LC_NUMERIC, "C")
 
-@cuda.jit(device=True)
+@cuda.jit("f4(f4)", device=True)
+def clip(val):
+    """Standard clamping of a value into a fixed range (in this case -4.0 to
+    4.0)
+
+    Parameters
+    ----------
+    val: float
+        The value to be clamped.
+
+    Returns
+    -------
+    The clamped value, now fixed to be in the range -4.0 to 4.0.
+    """
+    return max(min(val, 4.0), -4.0)
+
+
+@cuda.jit("f4(f4[:],f4[:])", device=True)
 def rdist(x, y):
     """Reduced Euclidean distance.
 
@@ -43,12 +60,9 @@ def optimize_layout_cuda(
     epoch,
     epochs_per_sample,
     epoch_of_next_sample,
-    a,
-    b,
+    various_floats,
+    various_ints,
     rng_states,
-    gamma,
-    alpha,
-    negative_sample_rate,
 ):
     """Improve an embedding using stochastic gradient descent to minimize the
     fuzzy set cross entropy between the 1-skeletons of the high dimensional
@@ -83,21 +97,16 @@ def optimize_layout_cuda(
     epoch_of_next_sample: array of shape (n_1_simplices)
         A float value indicating the next epoch that a 1-simplex is to be sampled.
 
-    a: float
-        Parameter of differentiable approximation of right adjoint functor
+    various_floats: array of shape (4)
+        An array containg the float values: a, b, gamma, initial_alpha (in that
+        order).
 
-    b: float
-        Parameter of differentiable approximation of right adjoint functor
+    various_ints: array of shape (3)
+        An array containg the float values: n_epochs, negative_sample_rate (in
+        that order).
 
-    rng_states: array of shape (
-    int64, shape (3,)
-        The internal state of the rng
-
-    gamma: float (optional, default 1.0)
-        Weight to apply to negative samples.
-
-    alpha: float (optional, default 1.0)
-        Initial learning rate for the SGD.
+    rng_states: array of shape (n_threads)
+        The internal states of the rng for each thread.
 
     negative_sample_rate: int (optional, default 5)
         Number of negative samples to use per positive sample.
@@ -118,7 +127,16 @@ def optimize_layout_cuda(
     edge_start = thread_id * thread_size
     edge_end = min((thread_id + 1) * thread_size, n_edges)
 
-    # for n in range(n_epochs): handled by caller
+    # unpack from various tuples/arrays
+    a = various_floats[0]
+    b = various_floats[1]
+    gamma = various_floats[2]
+    initial_alpha = various_floats[3]
+    n_epochs = various_ints[0]
+    negative_sample_rate = various_ints[1]
+    
+    alpha = min(initial_alpha, initial_alpha * (1.0 - (float(epoch - 1) / float(n_epochs))))
+
     for edge in range(edge_start, edge_end):
         if epoch_of_next_sample[edge] <= epoch:
             # load nodes for edge
@@ -129,14 +147,14 @@ def optimize_layout_cuda(
             
             dist_squared = rdist(current, other)
 
-            grad_coeff = -2.0 * a * b * pow(dist_squared, b - 1.0)
-            grad_coeff /= a * pow(dist_squared, b) + 1.0
-            
-            if dist_squared <= 0.0:
+            if dist_squared > 0.0:
+                grad_coeff = -2.0 * a * b * pow(dist_squared, b - 1.0)
+                grad_coeff /= a * pow(dist_squared, b) + 1.0
+            else:
                 grad_coeff = 0.0
-
+            
             for d in range(n_dims):
-                grad_d = max(min(grad_coeff * (current[d] - other[d]),4.0),-4.0)
+                grad_d = clip(grad_coeff * (current[d] - other[d]))
                 current[d] += grad_d * alpha
 
             epoch_of_next_sample[i] += epochs_per_sample[i]
@@ -160,7 +178,7 @@ def optimize_layout_cuda(
 
                 for d in range(n_dims):
                     if grad_coeff > 0.0:
-                        grad_d = max(min(grad_coeff * (current[d] - other[d]),4.0),-4.0)
+                        grad_d = clip(grad_coeff * (current[d] - other[d]))
                     else:
                         grad_d = 4.0
                     current[d] += grad_d * alpha
