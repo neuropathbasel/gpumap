@@ -1,9 +1,6 @@
 # Author: Peter Eisenmann
 #
 # License: BSD 3 clause
-from __future__ import print_function
-from warnings import warn
-
 from math import pow, ceil
 
 from numba import cuda
@@ -13,7 +10,7 @@ import locale
 
 locale.setlocale(locale.LC_NUMERIC, "C")
 
-@cuda.jit("f4(f4)", device=True)
+@cuda.jit(device=True)
 def clip(val):
     """Standard clamping of a value into a fixed range (in this case -4.0 to
     4.0)
@@ -30,7 +27,7 @@ def clip(val):
     return max(min(val, 4.0), -4.0)
 
 
-@cuda.jit("f4(f4[:],f4[:])", device=True)
+@cuda.jit(device=True)
 def rdist(x, y):
     """Reduced Euclidean distance.
 
@@ -60,6 +57,7 @@ def optimize_layout_cuda(
     epoch,
     epochs_per_sample,
     epoch_of_next_sample,
+    current_edges,
     various_floats,
     various_ints,
     rng_states,
@@ -97,11 +95,14 @@ def optimize_layout_cuda(
     epoch_of_next_sample: array of shape (n_1_simplices)
         A float value indicating the next epoch that a 1-simplex is to be sampled.
 
+    current_edges
+        An array used to prefilter all edges for current epoch into
+
     various_floats: array of shape (4)
         An array containg the float values: a, b, gamma, initial_alpha (in that
         order).
 
-    various_ints: array of shape (3)
+    various_ints: array of shape (2)
         An array containg the float values: n_epochs, negative_sample_rate (in
         that order).
 
@@ -122,11 +123,6 @@ def optimize_layout_cuda(
     n_vertices = read_embedding.shape[0]
     n_edges = head.shape[0]
 
-    # edges handled by this thread
-    thread_size = ceil(n_edges / n_threads)
-    edge_start = thread_id * thread_size
-    edge_end = min((thread_id + 1) * thread_size, n_edges)
-
     # unpack from various tuples/arrays
     a = various_floats[0]
     b = various_floats[1]
@@ -134,52 +130,75 @@ def optimize_layout_cuda(
     initial_alpha = various_floats[3]
     n_epochs = various_ints[0]
     negative_sample_rate = various_ints[1]
-    
-    alpha = min(initial_alpha, initial_alpha * (1.0 - (float(epoch - 1) / float(n_epochs))))
 
+    # edges handled by this thread
+    thread_size = int(ceil(n_edges / n_threads))
+    edge_start = thread_id * thread_size
+    edge_end = min((thread_id + 1) * thread_size, n_edges)
+
+    alpha = initial_alpha * (1.0 - (float(epoch) / float(n_epochs)))
+    
+    ##prefilter
+    count = 0
     for edge in range(edge_start, edge_end):
         if epoch_of_next_sample[edge] <= epoch:
-            # load nodes for edge
-            i = tail[edge]
-            current = write_embedding[i]
-            j = head[edge]
-            other = read_embedding[j]
-            
+            epoch_of_next_sample[edge] += epochs_per_sample[edge]
+            current_edges[edge_start + count] = edge
+            count += 1
+
+    cuda.syncthreads()
+    
+    ## normal algorithm
+    for prefiltered in range(count):
+        edge = current_edges[edge_start + prefiltered]
+
+        # load nodes for edge
+        i = tail[edge]
+        current = write_embedding[i]
+        j = head[edge]
+        other = read_embedding[j]
+        
+        dist_squared = rdist(current, other)
+
+        if dist_squared > 0.0:
+            grad_coeff = -2.0 * a * b * pow(dist_squared, b - 1.0)
+            grad_coeff /= a * pow(dist_squared, b) + 1.0
+        else:
+            grad_coeff = 0.0
+
+        for d in range(n_dims):
+            grad_d = clip(grad_coeff * (current[d] - other[d]))
+            current[d] += grad_d * alpha
+
+#        if dist_squared > 0.0:
+#            grad_coeff = -2.0 * a * b * pow(dist_squared, b - 1.0)
+#            grad_coeff /= a * pow(dist_squared, b) + 1.0
+#            for d in range(n_dims):
+#                grad_d = clip(grad_coeff * (current[d] - other[d]))
+#                current[d] += grad_d * alpha
+
+        for p in range(int(negative_sample_rate)):
+            # generate random number between 0 and N, not i or j
+            k = (((((
+                int(xoroshiro128p_uniform_float32(rng_states, thread_id))
+                % (n_vertices - 2)) + i + 1)
+                % (n_vertices  - 1)) + j + 1)
+                % n_vertices)
+
+            other = read_embedding[k]
+
             dist_squared = rdist(current, other)
 
+            grad_coeff = 0.0
+            grad_d = 4.0
             if dist_squared > 0.0:
-                grad_coeff = -2.0 * a * b * pow(dist_squared, b - 1.0)
-                grad_coeff /= a * pow(dist_squared, b) + 1.0
-            else:
-                grad_coeff = 0.0
-            
+                grad_coeff = 2.0 * gamma * b
+                grad_coeff /= (0.001 + dist_squared) * (
+                    a * pow(dist_squared, b) + 1.0
+                )
+
             for d in range(n_dims):
-                grad_d = clip(grad_coeff * (current[d] - other[d]))
+                if grad_coeff > 0.0:
+                    grad_d = clip(grad_coeff * (current[d] - other[d]))
                 current[d] += grad_d * alpha
-
-            epoch_of_next_sample[i] += epochs_per_sample[i]
-
-            for p in range(negative_sample_rate):
-                k = int(xoroshiro128p_uniform_float32(rng_states, thread_id)) % n_vertices
-
-                other = read_embedding[k]
-
-                dist_squared = rdist(current, other)
-
-                if dist_squared > 0.0:
-                    grad_coeff = 2.0 * gamma * b
-                    grad_coeff /= (0.001 + dist_squared) * (
-                        a * pow(dist_squared, b) + 1.0
-                    )
-                elif k==j:
-                    continue
-                else:
-                    grad_coeff = 0.0
-
-                for d in range(n_dims):
-                    if grad_coeff > 0.0:
-                        grad_d = clip(grad_coeff * (current[d] - other[d]))
-                    else:
-                        grad_d = 4.0
-                    current[d] += grad_d * alpha
-
+                

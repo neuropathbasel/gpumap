@@ -1,4 +1,5 @@
 # Author: Leland McInnes <leland.mcinnes@gmail.com>
+# Contributer: Peter Eisenmann <p3732@gmx.de>
 #
 # License: BSD 3 clause
 from __future__ import print_function
@@ -20,8 +21,6 @@ import numba
 from numba import cuda
 from numba.cuda.random import create_xoroshiro128p_states
 
-import time
-
 import umap.distances as dist
 
 import umap.sparse as sparse
@@ -36,6 +35,7 @@ from umap.nndescent import (
 )
 from umap.spectral import spectral_layout
 from umap.optimize_layout_cuda import optimize_layout_cuda
+from umap.nearest_neighbors_gpu import nearest_neighbors_gpu
 
 import locale
 
@@ -151,6 +151,83 @@ def smooth_knn_dist(distances, k, n_iter=64, local_connectivity=1.0, bandwidth=1
 
 
 def nearest_neighbors(
+    X, n_neighbors, metric, metric_kwds, angular, random_state, verbose=False,
+    use_gpu=True
+):
+    """Compute the ``n_neighbors`` nearest points for each data point in ``X``
+    under ``metric``. This may be exact, but more likely is approximated via
+    nearest neighbor descent.
+
+    Parameters
+    ----------
+    X: array of shape (n_samples, n_features)
+        The input data to compute the k-neighbor graph of.
+
+    n_neighbors: int
+        The number of nearest neighbors to compute for each sample in ``X``.
+
+    metric: string or callable
+        The metric to use for the computation.
+
+    metric_kwds: dict
+        Any arguments to pass to the metric computation function.
+
+    angular: bool
+        Whether to use angular rp trees in NN approximation.
+
+    random_state: np.random state
+        The random state to use for approximate NN computations.
+
+    verbose: bool (optional, default False)
+        Whether to print status data during the computation.
+
+    use_gpu: bool (optional, default True)
+        Whether to use the GPU for acceleration.
+
+    Returns
+    -------
+    knn_indices: array of shape (n_samples, n_neighbors)
+        The indices on the ``n_neighbors`` closest points in the dataset.
+
+    knn_dists: array of shape (n_samples, n_neighbors)
+        The distances to the ``n_neighbors`` closest points in the dataset.
+    """
+    if use_gpu and not cuda.is_available():
+         warn("GPU/CUDA is not available, falling back to CPU algorithm.")
+         use_gpu = False
+
+    if metric == "precomputed":
+        # Note that this does not support sparse distance matrices yet ...
+        # Compute indices of n nearest neighbors
+        knn_indices = np.argsort(X)[:, :n_neighbors]
+        # Compute the nearest neighbor distances
+        #   (equivalent to np.sort(X)[:,:n_neighbors])
+        knn_dists = X[np.arange(X.shape[0])[:, None], knn_indices].copy()
+
+        return knn_indices, knn_dists, []
+    else:
+        if use_gpu and metric != "euclidean":
+            warn("Using the GPU is currently only supported with an Euclidean "
+                 "metric, falling back to CPU implementation.")
+            use_gpu = False
+
+        if use_gpu and scipy.sparse.isspmatrix_csr(X):
+            warn("Using a sparse matrix on the GPU is currently not supported, "
+                 "falling back to CPU implementation.")
+            use_gpu = False
+
+        if use_gpu:
+            if verbose:
+                print("Running KNN on GPU.")
+            return nearest_neighbors_gpu(X, n_neighbors)
+        else:
+            return nearest_neighbors_cpu(
+                X, n_neighbors, metric, metric_kwds, angular, random_state,
+                verbose
+            )
+
+
+def nearest_neighbors_cpu(
     X, n_neighbors, metric, metric_kwds, angular, random_state, verbose=False
 ):
     """Compute the ``n_neighbors`` nearest points for each data point in ``X``
@@ -179,7 +256,6 @@ def nearest_neighbors(
 
     verbose: bool
         Whether to print status data during the computation.
-
     Returns
     -------
     knn_indices: array of shape (n_samples, n_neighbors)
@@ -188,87 +264,77 @@ def nearest_neighbors(
     knn_dists: array of shape (n_samples, n_neighbors)
         The distances to the ``n_neighbors`` closest points in the dataset.
     """
-    if metric == "precomputed":
-        # Note that this does not support sparse distance matrices yet ...
-        # Compute indices of n nearest neighbors
-        knn_indices = np.argsort(X)[:, :n_neighbors]
-        # Compute the nearest neighbor distances
-        #   (equivalent to np.sort(X)[:,:n_neighbors])
-        knn_dists = X[np.arange(X.shape[0])[:, None], knn_indices].copy()
-
-        rp_forest = []
+    if callable(metric):
+        distance_func = metric
+    elif metric in dist.named_distances:
+        distance_func = dist.named_distances[metric]
     else:
-        if callable(metric):
-            distance_func = metric
-        elif metric in dist.named_distances:
-            distance_func = dist.named_distances[metric]
+        raise ValueError("Metric is neither callable, " + "nor a recognised string")
+
+    if metric in ("cosine", "correlation", "dice", "jaccard"):
+        angular = True
+
+    rng_state = random_state.randint(INT32_MIN, INT32_MAX, 3).astype(np.int64)
+
+    if scipy.sparse.isspmatrix_csr(X):
+        if metric in sparse.sparse_named_distances:
+            distance_func = sparse.sparse_named_distances[metric]
+            if metric in sparse.sparse_need_n_features:
+                metric_kwds["n_features"] = X.shape[1]
         else:
-            raise ValueError("Metric is neither callable, " + "nor a recognised string")
-
-        if metric in ("cosine", "correlation", "dice", "jaccard"):
-            angular = True
-
-        rng_state = random_state.randint(INT32_MIN, INT32_MAX, 3).astype(np.int64)
-
-        if scipy.sparse.isspmatrix_csr(X):
-            if metric in sparse.sparse_named_distances:
-                distance_func = sparse.sparse_named_distances[metric]
-                if metric in sparse.sparse_need_n_features:
-                    metric_kwds["n_features"] = X.shape[1]
-            else:
-                raise ValueError(
-                    "Metric {} not supported for sparse " + "data".format(metric)
-                )
-            metric_nn_descent = sparse.make_sparse_nn_descent(
-                distance_func, tuple(metric_kwds.values())
+            raise ValueError(
+                "Metric {} not supported for sparse " + "data".format(metric)
             )
+        metric_nn_descent = sparse.make_sparse_nn_descent(
+            distance_func, tuple(metric_kwds.values())
+        )
 
-            # TODO: Hacked values for now
-            n_trees = 5 + int(round((X.shape[0]) ** 0.5 / 20.0))
-            n_iters = max(5, int(round(np.log2(X.shape[0]))))
+        # TODO: Hacked values for now
+        n_trees = 5 + int(round((X.shape[0]) ** 0.5 / 20.0))
+        n_iters = max(5, int(round(np.log2(X.shape[0]))))
 
-            rp_forest = make_forest(X, n_neighbors, n_trees, rng_state, angular)
-            leaf_array = rptree_leaf_array(rp_forest)
-            knn_indices, knn_dists = metric_nn_descent(
-                X.indices,
-                X.indptr,
-                X.data,
-                X.shape[0],
-                n_neighbors,
-                rng_state,
-                max_candidates=60,
-                rp_tree_init=True,
-                leaf_array=leaf_array,
-                n_iters=n_iters,
-                verbose=verbose,
-            )
-        else:
-            metric_nn_descent = make_nn_descent(
-                distance_func, tuple(metric_kwds.values())
-            )
-            # TODO: Hacked values for now
-            n_trees = 5 + int(round((X.shape[0]) ** 0.5 / 20.0))
-            n_iters = max(5, int(round(np.log2(X.shape[0]))))
+        rp_forest = make_forest(X, n_neighbors, n_trees, rng_state, angular)
+        leaf_array = rptree_leaf_array(rp_forest)
+        knn_indices, knn_dists = metric_nn_descent(
+            X.indices,
+            X.indptr,
+            X.data,
+            X.shape[0],
+            n_neighbors,
+            rng_state,
+            max_candidates=60,
+            rp_tree_init=True,
+            leaf_array=leaf_array,
+            n_iters=n_iters,
+            verbose=verbose,
+        )
+    else:
+        metric_nn_descent = make_nn_descent(
+            distance_func, tuple(metric_kwds.values())
+        )
+        # TODO: Hacked values for now
+        n_trees = 5 + int(round((X.shape[0]) ** 0.5 / 20.0))
+        n_iters = max(5, int(round(np.log2(X.shape[0]))))
 
-            rp_forest = make_forest(X, n_neighbors, n_trees, rng_state, angular)
-            leaf_array = rptree_leaf_array(rp_forest)
-            knn_indices, knn_dists = metric_nn_descent(
-                X,
-                n_neighbors,
-                rng_state,
-                max_candidates=60,
-                rp_tree_init=True,
-                leaf_array=leaf_array,
-                n_iters=n_iters,
-                verbose=verbose,
-            )
+        rp_forest = make_forest(X, n_neighbors, n_trees, rng_state, angular)
+        leaf_array = rptree_leaf_array(rp_forest)
+        knn_indices, knn_dists = metric_nn_descent(
+            X,
+            n_neighbors,
+            rng_state,
+            max_candidates=60,
+            rp_tree_init=True,
+            leaf_array=leaf_array,
+            n_iters=n_iters,
+            verbose=verbose,
+        )
 
-        if np.any(knn_indices < 0):
-            warn(
-                "Failed to correctly find n_neighbors for some samples."
-                "Results may be less than ideal. Try re-running with"
-                "different parameters."
-            )
+    if np.any(knn_indices < 0):
+        warn(
+            "Failed to correctly find n_neighbors for some samples."
+            "Results may be less than ideal. Try re-running with"
+            "different parameters."
+        )
 
     return knn_indices, knn_dists, rp_forest
 
@@ -343,6 +409,7 @@ def fuzzy_simplicial_set(
     set_op_mix_ratio=1.0,
     local_connectivity=1.0,
     verbose=False,
+    use_gpu=True,
 ):
     """Given a set of data X, a neighborhood size, and a measure of distance
     compute the fuzzy simplicial set (here represented as a fuzzy graph in
@@ -440,6 +507,9 @@ def fuzzy_simplicial_set(
     verbose: bool (optional, default False)
         Whether to report information on the current progress of the algorithm.
 
+    use_gpu: bool (optional, default True)
+        Whether to use the GPU for acceleration.
+
     Returns
     -------
     fuzzy_simplicial_set: coo_matrix
@@ -449,7 +519,8 @@ def fuzzy_simplicial_set(
     """
     if knn_indices is None or knn_dists is None:
         knn_indices, knn_dists, _ = nearest_neighbors(
-            X, n_neighbors, metric, metric_kwds, angular, random_state, verbose=verbose
+            X, n_neighbors, metric, metric_kwds, angular, random_state, verbose,
+            use_gpu
         )
 
     sigmas, rhos = smooth_knn_dist(
@@ -656,12 +727,7 @@ def clip(val):
     -------
     The clamped value, now fixed to be in the range -4.0 to 4.0.
     """
-    if val > 4.0:
-        return 4.0
-    elif val < -4.0:
-        return -4.0
-    else:
-        return val
+    return max(min(val, 4.0), -4.0)
 
 
 @numba.njit("f4(f4[:],f4[:])", fastmath=True)
@@ -698,8 +764,8 @@ def optimize_layout(
     gamma=1.0,
     initial_alpha=1.0,
     negative_sample_rate=5,
-    verbose=True, #TODO set back to False
-    use_cuda=True
+    verbose=False,
+    use_gpu=True
 ):
     """Improve an embedding using stochastic gradient descent to minimize the
     fuzzy set cross entropy between the 1-skeletons of the high dimensional
@@ -755,20 +821,25 @@ def optimize_layout(
     verbose: bool (optional, default False)
         Whether to report information on the current progress of the algorithm.
 
+    use_gpu: bool (optional, default True)
+        Whether to use the GPU for acceleration.
+
     Returns
     -------
     embedding: array of shape (n_samples, n_components)
         The optimized embedding.
     """
-    cuda_available = cuda.is_available()
-    
-    if cuda_available == use_cuda:
-        if True: #TODO verbose:
-            print("using CUDA")
+    if use_gpu and not cuda.is_available():
+         warn("GPU/CUDA is not available, falling back to CPU algorithm.")
+         use_gpu = False
+
+    if use_gpu:
+        if verbose:
+            print("Running layout optimization on GPU.")
         optimize_func = optimize_layout_gpu
     else:
         optimize_func = optimize_layout_cpu
-    
+
     return optimize_func(
         head_embedding,
         tail_embedding,
@@ -920,7 +991,7 @@ def optimize_layout_cpu(
                         else:
                             grad_d = 4.0
                         current[d] += grad_d * alpha
-                        
+
         alpha = initial_alpha * (1.0 - (float(n) / float(n_epochs)))
 
         if verbose and n % int(n_epochs / 10) == 0:
@@ -945,9 +1016,6 @@ def optimize_layout_gpu(
     negative_sample_rate,
     verbose,
 ):
-    if True: # verbose
-        print("### init gpu")
-        start = time.time()
     if verbose and negative_sample_rate != int(negative_sample_rate):
         print("rounding negative sample rate to ", int(negative_sample_rate))
     negative_sample_rate = int(negative_sample_rate)
@@ -957,23 +1025,25 @@ def optimize_layout_gpu(
     n_edges = head.shape[0]
 
     threads_per_block = 32
-    #TODO does this really make sense?
+    #TODO test multiple values
     blocks_per_grid = 4096 // threads_per_block
     n_threads = blocks_per_grid * threads_per_block
-    
+    #n_epochs = n_epochs // 2
+
     move_other = head_embedding.shape[0] == tail_embedding.shape[0]
-    
+
     # copy arrays to device
     d_head_embedding = cuda.to_device(head_embedding)
     if move_other:
         d_tail_embedding = cuda.to_device(tail_embedding)
     else:
         d_tail_embedding = d_head_embedding
-    
+
     d_head = cuda.to_device(head)
     d_tail = cuda.to_device(tail)
     d_epochs_per_sample = cuda.to_device(epochs_per_sample)
     d_epoch_of_next_sample = cuda.to_device(epochs_per_sample)
+    d_current_edges = cuda.to_device(np.zeros(n_edges, dtype=np.int64))
     d_rng_states = create_xoroshiro128p_states(n_threads,seed=rng_state[0])
 
     d_various_floats = cuda.to_device((
@@ -986,11 +1056,6 @@ def optimize_layout_gpu(
         n_epochs,
         negative_sample_rate
     ))
-    
-    if True: #verbose
-        end = time.time()
-        print("### end init gpu")
-        print(end - start)
 
     for n in range(n_epochs):
         optimize_layout_cuda[blocks_per_grid, threads_per_block](
@@ -1001,16 +1066,17 @@ def optimize_layout_gpu(
             n,
             d_epochs_per_sample,
             d_epoch_of_next_sample,
+            d_current_edges,
             d_various_floats,
             d_various_ints,
             d_rng_states,
         )
-    
+
     # copy arrays back from device
     head_embedding = d_head_embedding.copy_to_host()
-    
+
     return head_embedding
-        
+
 
 def simplicial_set_embedding(
     data,
@@ -1027,6 +1093,7 @@ def simplicial_set_embedding(
     metric,
     metric_kwds,
     verbose,
+    use_gpu,
 ):
     """Perform a fuzzy simplicial set embedding, using a specified
     initialisation method and then minimizing the fuzzy set cross entropy
@@ -1090,6 +1157,9 @@ def simplicial_set_embedding(
     verbose: bool (optional, default False)
         Whether to report information on the current progress of the algorithm.
 
+    use_gpu: bool (optional, default True)
+        Whether to use the GPU for acceleration.
+
     Returns
     -------
     embedding: array of shape (n_samples, n_components)
@@ -1151,7 +1221,8 @@ def simplicial_set_embedding(
     tail = graph.col
 
     rng_state = random_state.randint(INT32_MIN, INT32_MAX, 3).astype(np.int64)
-    return (
+
+    embedding = optimize_layout(
         embedding,
         embedding,
         head,
@@ -1162,11 +1233,30 @@ def simplicial_set_embedding(
         a,
         b,
         rng_state,
-        gamma,
-        initial_alpha,
-        negative_sample_rate,
-        verbose,
+        gamma=gamma,
+        initial_alpha=initial_alpha,
+        negative_sample_rate=negative_sample_rate,
+        verbose=verbose,
+        use_gpu=use_gpu,
     )
+    
+    return embedding
+#    return (
+#        embedding,
+#        embedding,
+#        head,
+#        tail,
+#        n_epochs,
+#        n_vertices,
+#        epochs_per_sample,
+#        a,
+#        b,
+#        rng_state,
+#        gamma,
+#        initial_alpha,
+#        negative_sample_rate,
+#        verbose,
+#    )
 
 @numba.njit()
 def init_transform(indices, weights, embedding):
@@ -1413,6 +1503,7 @@ class UMAP(BaseEstimator):
         target_weight=0.5,
         transform_seed=42,
         verbose=False,
+        use_gpu=True,
     ):
 
         self.n_neighbors = n_neighbors
@@ -1438,6 +1529,7 @@ class UMAP(BaseEstimator):
         self.target_weight = target_weight
         self.transform_seed = transform_seed
         self.verbose = verbose
+        self.use_gpu = use_gpu
 
         self.a = a
         self.b = b
@@ -1480,6 +1572,9 @@ class UMAP(BaseEstimator):
         ):
             raise ValueError("n_epochs must be a positive integer "
                              "larger than 10")
+        if self.use_gpu and not cuda.is_available():
+            warn("GPU/CUDA seems to currently not be available, will fall back "
+                "to CPU algorithm if this persists.")
 
     def fit(self, X, y=None):
         """Fit X into an embedded space.
@@ -1575,6 +1670,7 @@ class UMAP(BaseEstimator):
                 self.set_op_mix_ratio,
                 self.local_connectivity,
                 self.verbose,
+                self.use_gpu,
             )
         else:
             self._small_data = False
@@ -1587,6 +1683,7 @@ class UMAP(BaseEstimator):
                 self.angular_rp_forest,
                 random_state,
                 self.verbose,
+                self.use_gpu,
             )
 
             self.graph_ = fuzzy_simplicial_set(
@@ -1601,6 +1698,7 @@ class UMAP(BaseEstimator):
                 self.set_op_mix_ratio,
                 self.local_connectivity,
                 self.verbose,
+                self.use_gpu,
             )
 
             self._search_graph = scipy.sparse.lil_matrix(
@@ -1671,6 +1769,7 @@ class UMAP(BaseEstimator):
                         False,
                         1.0,
                         1.0,
+                        False,
                         False
                     )
                 else:
@@ -1687,6 +1786,7 @@ class UMAP(BaseEstimator):
                         1.0,
                         1.0,
                         False,
+                        self.use_gpu,
                     )
                 # product = self.graph_.multiply(target_graph)
                 # # self.graph_ = 0.99 * product + 0.01 * (self.graph_ +
@@ -1705,10 +1805,10 @@ class UMAP(BaseEstimator):
 
         if self.verbose:
             print("Construct embedding")
-        
+
         self._input_hash = joblib.hash(self._raw_data)
 
-        return simplicial_set_embedding(
+        self.embedding_ = simplicial_set_embedding(
             self._raw_data,
             self.graph_,
             self.n_components,
@@ -1723,29 +1823,65 @@ class UMAP(BaseEstimator):
             self.metric,
             self._metric_kwds,
             self.verbose,
+            self.use_gpu,
         )
 
+#        return simplicial_set_embedding(
+#            self._raw_data,
+#            self.graph_,
+#            self.n_components,
+#            self._initial_alpha,
+#            self._a,
+#            self._b,
+#            self.repulsion_strength,
+#            self.negative_sample_rate,
+#            n_epochs,
+#            init,
+#            random_state,
+#            self.metric,
+#            self._metric_kwds,
+#            self.verbose,
+#            self.use_gpu,
+#        )
 
-    def fit_2(self, pre_embedding, use_cuda=True):
-        self.embedding_ = optimize_layout(
-            pre_embedding[0],
-            pre_embedding[1],
-            pre_embedding[2],
-            pre_embedding[3],
-            pre_embedding[4],
-            pre_embedding[5],
-            pre_embedding[6],
-            pre_embedding[7],
-            pre_embedding[8],
-            pre_embedding[9],
-            pre_embedding[10],
-            pre_embedding[11],
-            pre_embedding[12],
-            pre_embedding[13],
-            use_cuda
-        )
 
-        return self
+#    def fit_2(self, pre_embedding, use_gpu=True):
+#        self.embedding_ = optimize_layout(
+#            self._raw_data,
+#            self.graph_,
+#            self.n_components,
+#            self._initial_alpha,
+#            self._a,
+#            self._b,
+#            self.repulsion_strength,
+#            self.negative_sample_rate,
+#            n_epochs,
+#            init,
+#            random_state,
+#            self.metric,
+#            self._metric_kwds,
+#            self.verbose,
+#            self.use_gpu,
+
+
+#            pre_embedding[0],
+#            pre_embedding[1],
+#            pre_embedding[2],
+#            pre_embedding[3],
+#            pre_embedding[4],
+#            pre_embedding[5],
+#            pre_embedding[6],
+#            pre_embedding[7],
+#            pre_embedding[8],
+#            pre_embedding[9],
+#            pre_embedding[10],
+#            pre_embedding[11],
+#            pre_embedding[12],
+#            pre_embedding[13],
+#            use_gpu
+#        )
+
+#        return self
 
     def fit_transform(self, X, y=None):
         """Fit X into an embedded space and return that transformed
@@ -1886,10 +2022,11 @@ class UMAP(BaseEstimator):
             self._a,
             self._b,
             rng_state,
-            self.repulsion_strength,
-            self._initial_alpha,
-            self.negative_sample_rate,
+            gamma=self.repulsion_strength,
+            initial_alpha=self._initial_alpha,
+            negative_sample_rate=self.negative_sample_rate,
             verbose=self.verbose,
+            use_gpu=self.use_gpu
         )
 
         return embedding
