@@ -6,7 +6,7 @@ from __future__ import print_function
 import numpy as np
 import numba
 
-from umap.utils import (
+from gpumap.utils import (
     tau_rand,
     make_heap,
     heap_push,
@@ -18,7 +18,7 @@ from umap.utils import (
     deheap_sort,
 )
 
-from umap.rp_tree import search_flat_tree
+from gpumap.rp_tree import search_flat_tree
 
 
 def make_nn_descent(dist, dist_args):

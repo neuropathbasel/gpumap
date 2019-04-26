@@ -19,23 +19,22 @@ import scipy.sparse
 import scipy.sparse.csgraph
 import numba
 from numba import cuda
-from numba.cuda.random import create_xoroshiro128p_states
 
-import umap.distances as dist
+import gpumap.distances as dist
 
-import umap.sparse as sparse
+import gpumap.sparse as sparse
 
-from umap.utils import tau_rand_int, deheap_sort, submatrix
-from umap.rp_tree import rptree_leaf_array, make_forest
-from umap.nndescent import (
+from gpumap.utils import tau_rand_int, deheap_sort, submatrix
+from gpumap.rp_tree import rptree_leaf_array, make_forest
+from gpumap.nndescent import (
     make_nn_descent,
     make_initialisations,
     make_initialized_nnd_search,
     initialise_search,
 )
-from umap.spectral import spectral_layout
-from umap.optimize_layout_cuda import optimize_layout_cuda
-from umap.nearest_neighbors_gpu import nearest_neighbors_gpu
+from gpumap.spectral import spectral_layout
+from gpumap.optimize_layout_gpu import optimize_layout_gpu
+from gpumap.nearest_neighbors_gpu import nearest_neighbors_gpu
 
 import locale
 
@@ -230,40 +229,8 @@ def nearest_neighbors(
 def nearest_neighbors_cpu(
     X, n_neighbors, metric, metric_kwds, angular, random_state, verbose=False
 ):
-    """Compute the ``n_neighbors`` nearest points for each data point in ``X``
-    under ``metric``. This may be exact, but more likely is approximated via
-    nearest neighbor descent.
+    """CPU implementation of nearest_neighbors, see there for documentation."""
 
-    Parameters
-    ----------
-    X: array of shape (n_samples, n_features)
-        The input data to compute the k-neighbor graph of.
-
-    n_neighbors: int
-        The number of nearest neighbors to compute for each sample in ``X``.
-
-    metric: string or callable
-        The metric to use for the computation.
-
-    metric_kwds: dict
-        Any arguments to pass to the metric computation function.
-
-    angular: bool
-        Whether to use angular rp trees in NN approximation.
-
-    random_state: np.random state
-        The random state to use for approximate NN computations.
-
-    verbose: bool
-        Whether to print status data during the computation.
-    Returns
-    -------
-    knn_indices: array of shape (n_samples, n_neighbors)
-        The indices on the ``n_neighbors`` closest points in the dataset.
-
-    knn_dists: array of shape (n_samples, n_neighbors)
-        The distances to the ``n_neighbors`` closest points in the dataset.
-    """
     if callable(metric):
         distance_func = metric
     elif metric in dist.named_distances:
@@ -1000,84 +967,6 @@ def optimize_layout_cpu(
     return head_embedding
 
 
-def optimize_layout_gpu(
-    head_embedding,
-    tail_embedding,
-    head,
-    tail,
-    n_epochs,
-    n_vertices,
-    epochs_per_sample,
-    a,
-    b,
-    rng_state,
-    gamma,
-    initial_alpha,
-    negative_sample_rate,
-    verbose,
-):
-    if verbose and negative_sample_rate != int(negative_sample_rate):
-        print("rounding negative sample rate to ", int(negative_sample_rate))
-    negative_sample_rate = int(negative_sample_rate)
-
-    # tail is sorted ascending over all nodes
-    # head is locally ascending per node
-    n_edges = head.shape[0]
-
-    threads_per_block = 32
-    #TODO test multiple values
-    blocks_per_grid = 4096 // threads_per_block
-    n_threads = blocks_per_grid * threads_per_block
-    #n_epochs = n_epochs // 2
-
-    move_other = head_embedding.shape[0] == tail_embedding.shape[0]
-
-    # copy arrays to device
-    d_head_embedding = cuda.to_device(head_embedding)
-    if move_other:
-        d_tail_embedding = cuda.to_device(tail_embedding)
-    else:
-        d_tail_embedding = d_head_embedding
-
-    d_head = cuda.to_device(head)
-    d_tail = cuda.to_device(tail)
-    d_epochs_per_sample = cuda.to_device(epochs_per_sample)
-    d_epoch_of_next_sample = cuda.to_device(epochs_per_sample)
-    d_current_edges = cuda.to_device(np.zeros(n_edges, dtype=np.int64))
-    d_rng_states = create_xoroshiro128p_states(n_threads,seed=rng_state[0])
-
-    d_various_floats = cuda.to_device((
-        a,
-        b,
-        gamma,
-        initial_alpha
-    ))
-    d_various_ints = cuda.to_device((
-        n_epochs,
-        negative_sample_rate
-    ))
-
-    for n in range(n_epochs):
-        optimize_layout_cuda[blocks_per_grid, threads_per_block](
-            d_head_embedding,
-            d_tail_embedding,
-            d_head,
-            d_tail,
-            n,
-            d_epochs_per_sample,
-            d_epoch_of_next_sample,
-            d_current_edges,
-            d_various_floats,
-            d_various_ints,
-            d_rng_states,
-        )
-
-    # copy arrays back from device
-    head_embedding = d_head_embedding.copy_to_host()
-
-    return head_embedding
-
-
 def simplicial_set_embedding(
     data,
     graph,
@@ -1241,6 +1130,7 @@ def simplicial_set_embedding(
     )
     
     return embedding
+
 #    return (
 #        embedding,
 #        embedding,
@@ -1309,7 +1199,7 @@ def find_ab_params(spread, min_dist):
     return params[0], params[1]
 
 
-class UMAP(BaseEstimator):
+class GPUMAP(BaseEstimator):
     """Uniform Manifold Approximation and Projection
 
     Finds a low dimensional embedding of the data that approximates
@@ -1826,6 +1716,8 @@ class UMAP(BaseEstimator):
             self.use_gpu,
         )
 
+        return self
+
 #        return simplicial_set_embedding(
 #            self._raw_data,
 #            self.graph_,
@@ -1845,43 +1737,27 @@ class UMAP(BaseEstimator):
 #        )
 
 
-#    def fit_2(self, pre_embedding, use_gpu=True):
-#        self.embedding_ = optimize_layout(
-#            self._raw_data,
-#            self.graph_,
-#            self.n_components,
-#            self._initial_alpha,
-#            self._a,
-#            self._b,
-#            self.repulsion_strength,
-#            self.negative_sample_rate,
-#            n_epochs,
-#            init,
-#            random_state,
-#            self.metric,
-#            self._metric_kwds,
-#            self.verbose,
-#            self.use_gpu,
+    def fit_2(self, pre_embedding, use_gpu=True):
+        self.embedding_ = optimize_layout(
+            pre_embedding[0],
+            pre_embedding[1],
+            pre_embedding[2],
+            pre_embedding[3],
+            pre_embedding[4],
+            pre_embedding[5],
+            pre_embedding[6],
+            pre_embedding[7],
+            pre_embedding[8],
+            pre_embedding[9],
+            pre_embedding[10],
+            pre_embedding[11],
+            pre_embedding[12],
+            pre_embedding[13],
+            use_gpu
+        )
 
+        return self
 
-#            pre_embedding[0],
-#            pre_embedding[1],
-#            pre_embedding[2],
-#            pre_embedding[3],
-#            pre_embedding[4],
-#            pre_embedding[5],
-#            pre_embedding[6],
-#            pre_embedding[7],
-#            pre_embedding[8],
-#            pre_embedding[9],
-#            pre_embedding[10],
-#            pre_embedding[11],
-#            pre_embedding[12],
-#            pre_embedding[13],
-#            use_gpu
-#        )
-
-#        return self
 
     def fit_transform(self, X, y=None):
         """Fit X into an embedded space and return that transformed

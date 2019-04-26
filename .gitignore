@@ -1,0 +1,4 @@
+build/
+dist/
+gpumap/__pycache__/
+gpumap.egg-info
