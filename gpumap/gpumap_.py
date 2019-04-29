@@ -1396,7 +1396,7 @@ class GPUMAP(BaseEstimator):
         metric="euclidean",
         n_epochs=None,
         learning_rate=1.0,
-        init="spectral",
+        init="random",
         min_dist=0.1,
         spread=1.0,
         set_op_mix_ratio=1.0,
