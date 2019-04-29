@@ -1741,6 +1741,8 @@ class GPUMAP(BaseEstimator):
             self.use_gpu,
         )
 
+        self._input_hash = joblib.hash(self._raw_data)
+
         return self
 
 
