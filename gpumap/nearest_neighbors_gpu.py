@@ -34,20 +34,36 @@ def nearest_neighbors_gpu(X, n_neighbors):
     X = np.ascontiguousarray(X.astype(np.float32))
     n_samples = X.shape[0]
     n_dims = X.shape[1]
+
     resource = faiss.StandardGpuResources()
     
     index = faiss.GpuIndexFlatL2(resource, n_dims)
     index.train(X)
     index.add(X)
-    
     knn_dists, knn_indices = index.search(X, n_neighbors)
 
-    if np.any(knn_indices < 0):
-        warn(
-            "Failed to correctly find n_neighbors for some samples."
-            "Results may be less than ideal. Try re-running with"
-            "different parameters."
-        )
-
     return knn_indices, knn_dists, []
+
+#        # Code as faiss is used by tsne-cuda.
+#        # It performs slower and is therefore not used
+
+#        from math import sqrt
+
+#        kNumCells = int(sqrt(float(n_samples)))
+#        kNumCellsToProbe = 20
+
+#        # Construct the GPU configuration object
+#        config = faiss.GpuIndexIVFFlatConfig()
+#        config.device = 0
+#        config.indicesOptions = faiss.INDICES_32_BIT
+#        config.flatConfig.useFloat16 = False
+#        config.useFloat16IVFStorage = False
+
+#        index = faiss.GpuIndexIVFFlat(resource, n_dims, kNumCells, faiss.METRIC_L2, config)
+#        index.setNumProbes(kNumCellsToProbe)
+#        index.train(X) #n_samples, points)
+#        index.add(X) #n_samples, points)
+
+#        # Perform the KNN query
+#        knn_dists, knn_indices = index.search(X, n_neighbors)
 

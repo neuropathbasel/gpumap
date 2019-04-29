@@ -40,6 +40,8 @@ import locale
 
 locale.setlocale(locale.LC_NUMERIC, "C")
 
+import time
+
 INT32_MIN = np.iinfo(np.int32).min + 1
 INT32_MAX = np.iinfo(np.int32).max - 1
 
@@ -215,16 +217,34 @@ def nearest_neighbors(
                  "falling back to CPU implementation.")
             use_gpu = False
 
+        if use_gpu and n_neighbors >= 1024:
+            warn("GPU can not handle more than 1024 nearest neighbors, falling "
+                 "back to CPU implementation.")
+            use_gpu = False
+
         if use_gpu:
             if verbose:
+                start=time.time()
                 print("Running KNN on GPU.")
-            return nearest_neighbors_gpu(X, n_neighbors)
+            knn_indices, knn_dists, rp_forest = nearest_neighbors_gpu(
+                X, n_neighbors
+            )
+            if verbose:
+                end=time.time()
+                print("Finished KNN on GPU in {0} seconds".format(end-start))
         else:
-            return nearest_neighbors_cpu(
+            knn_indices, knn_dists, rp_forest = nearest_neighbors_cpu(
                 X, n_neighbors, metric, metric_kwds, angular, random_state,
                 verbose
             )
+    if np.any(knn_indices < 0):
+        warn(
+            "Failed to correctly find n_neighbors for some samples."
+            "Results may be less than ideal. Try re-running with"
+            "different parameters."
+        )
 
+    return knn_indices, knn_dists, rp_forest
 
 def nearest_neighbors_cpu(
     X, n_neighbors, metric, metric_kwds, angular, random_state, verbose=False
@@ -294,13 +314,6 @@ def nearest_neighbors_cpu(
             leaf_array=leaf_array,
             n_iters=n_iters,
             verbose=verbose,
-        )
-
-    if np.any(knn_indices < 0):
-        warn(
-            "Failed to correctly find n_neighbors for some samples."
-            "Results may be less than ideal. Try re-running with"
-            "different parameters."
         )
 
     return knn_indices, knn_dists, rp_forest
