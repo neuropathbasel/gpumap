@@ -1765,7 +1765,7 @@ class GPUMAP(BaseEstimator):
         X_new : array, shape (n_samples, n_components)
             Embedding of the training data in low-dimensional space.
         """
-        self.embedding_ = self.fit(X, y)
+        self.fit(X, y)
 
         return self.embedding_
 
