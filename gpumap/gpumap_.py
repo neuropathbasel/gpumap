@@ -33,8 +33,10 @@ from gpumap.nndescent import (
     initialise_search,
 )
 from gpumap.spectral import spectral_layout
+
 from gpumap.optimize_layout_gpu import optimize_layout_gpu
 from gpumap.nearest_neighbors_gpu import nearest_neighbors_gpu
+from gpumap.smooth_knn_dist_gpu import smooth_knn_dist_gpu
 
 import locale
 
@@ -50,8 +52,9 @@ MIN_K_DIST_SCALE = 1e-3
 NPY_INFINITY = np.inf
 
 
-@numba.njit(parallel=True, fastmath=True)
-def smooth_knn_dist(distances, k, n_iter=64, local_connectivity=1.0, bandwidth=1.0):
+def smooth_knn_dist(
+    distances, k, n_iter=64, local_connectivity=1.0, bandwidth=1.0, use_gpu=True
+):
     """Compute a continuous version of the distance to the kth nearest
     neighbor. That is, this is similar to knn-distance but allows continuous
     k values rather than requiring an integral k. In esscence we are simply
@@ -82,6 +85,9 @@ def smooth_knn_dist(distances, k, n_iter=64, local_connectivity=1.0, bandwidth=1
         The target bandwidth of the kernel, larger values will produce
         larger return values.
 
+    use_gpu: bool (optional, default True)
+        Whether to use the GPU for acceleration.
+
     Returns
     -------
     knn_dist: array of shape (n_samples,)
@@ -90,6 +96,24 @@ def smooth_knn_dist(distances, k, n_iter=64, local_connectivity=1.0, bandwidth=1
     nn_dist: array of shape (n_samples,)
         The distance to the 1st nearest neighbor for each point.
     """
+    if use_gpu and not cuda.is_available():
+        warn("GPU/CUDA is not available, falling back to CPU algorithm.")
+        use_gpu = False
+
+    if use_gpu:
+        return smooth_knn_dist_gpu(
+            distances, k, n_iter, local_connectivity, bandwidth,
+            SMOOTH_K_TOLERANCE, MIN_K_DIST_SCALE
+        )
+    else:
+        return smooth_knn_dist_cpu(
+            distances, k, n_iter, local_connectivity, bandwidth
+        )
+
+
+@numba.njit(parallel=True, fastmath=True)
+def smooth_knn_dist_cpu(distances, k, n_iter, local_connectivity, bandwidth):
+
     target = np.log2(k) * bandwidth
     rho = np.zeros(distances.shape[0])
     result = np.zeros(distances.shape[0])
@@ -217,7 +241,7 @@ def nearest_neighbors(
                  "falling back to CPU implementation.")
             use_gpu = False
 
-        if use_gpu and n_neighbors >= 1024:
+        if use_gpu and n_neighbors > 1024:
             warn("GPU can not handle more than 1024 nearest neighbors, falling "
                  "back to CPU implementation.")
             use_gpu = False
@@ -504,7 +528,8 @@ def fuzzy_simplicial_set(
         )
 
     sigmas, rhos = smooth_knn_dist(
-        knn_dists, n_neighbors, local_connectivity=local_connectivity
+        knn_dists, n_neighbors, local_connectivity=local_connectivity,
+        use_gpu=use_gpu
     )
 
     rows, cols, vals = compute_membership_strengths(
@@ -1144,22 +1169,6 @@ def simplicial_set_embedding(
     
     return embedding
 
-#    return (
-#        embedding,
-#        embedding,
-#        head,
-#        tail,
-#        n_epochs,
-#        n_vertices,
-#        epochs_per_sample,
-#        a,
-#        b,
-#        rng_state,
-#        gamma,
-#        initial_alpha,
-#        negative_sample_rate,
-#        verbose,
-#    )
 
 @numba.njit()
 def init_transform(indices, weights, embedding):
@@ -1478,6 +1487,9 @@ class GPUMAP(BaseEstimator):
         if self.use_gpu and not cuda.is_available():
             warn("GPU/CUDA seems to currently not be available, will fall back "
                 "to CPU algorithm if this persists.")
+        if self.use_gpu and self.target_n_neighbors > 1024:
+            warn("GPU can not handle more than 1024 neighbors, will fall back "
+                "to CPU algorithm for KNN search.")
 
     def fit(self, X, y=None):
         """Fit X into an embedded space.
@@ -1731,46 +1743,6 @@ class GPUMAP(BaseEstimator):
 
         return self
 
-#        return simplicial_set_embedding(
-#            self._raw_data,
-#            self.graph_,
-#            self.n_components,
-#            self._initial_alpha,
-#            self._a,
-#            self._b,
-#            self.repulsion_strength,
-#            self.negative_sample_rate,
-#            n_epochs,
-#            init,
-#            random_state,
-#            self.metric,
-#            self._metric_kwds,
-#            self.verbose,
-#            self.use_gpu,
-#        )
-
-
-    def fit_2(self, pre_embedding, use_gpu=True):
-        self.embedding_ = optimize_layout(
-            pre_embedding[0],
-            pre_embedding[1],
-            pre_embedding[2],
-            pre_embedding[3],
-            pre_embedding[4],
-            pre_embedding[5],
-            pre_embedding[6],
-            pre_embedding[7],
-            pre_embedding[8],
-            pre_embedding[9],
-            pre_embedding[10],
-            pre_embedding[11],
-            pre_embedding[12],
-            pre_embedding[13],
-            use_gpu
-        )
-
-        return self
-
 
     def fit_transform(self, X, y=None):
         """Fit X into an embedded space and return that transformed
@@ -1793,8 +1765,8 @@ class GPUMAP(BaseEstimator):
         X_new : array, shape (n_samples, n_components)
             Embedding of the training data in low-dimensional space.
         """
-        pre_embed = self.fit(X, y)
-        self.fit_2(pre_embed)
+        self.embedding_ = self.fit(X, y)
+
         return self.embedding_
 
     def transform(self, X):
@@ -1866,7 +1838,8 @@ class GPUMAP(BaseEstimator):
 
         adjusted_local_connectivity = max(0, self.local_connectivity - 1.0)
         sigmas, rhos = smooth_knn_dist(
-            dists, self._n_neighbors, local_connectivity=adjusted_local_connectivity
+            dists, self._n_neighbors, local_connectivity=adjusted_local_connectivity,
+            use_gpu=self.use_gpu
         )
 
         rows, cols, vals = compute_membership_strengths(indices, dists, sigmas, rhos)

@@ -31,12 +31,17 @@ def nearest_neighbors_gpu(X, n_neighbors):
     knn_dists: array of shape (n_samples, n_neighbors)
         The distances to the ``n_neighbors`` closest points in the dataset.
     """
-    X = np.ascontiguousarray(X.astype(np.float32))
+    # Simple implementation. Basically also brute force, but does not need as
+    # much memory as bruteForceKnn for unknown reasons. Performs maybe half a
+    # second slower for small data sets
     n_samples = X.shape[0]
     n_dims = X.shape[1]
 
+    # assure that data is contiguous, otherwise FAISS can not process it
+    X = np.ascontiguousarray(X.astype(np.float32))
+
     resource = faiss.StandardGpuResources()
-    
+
     index = faiss.GpuIndexFlatL2(resource, n_dims)
     index.train(X)
     index.add(X)
@@ -44,26 +49,58 @@ def nearest_neighbors_gpu(X, n_neighbors):
 
     return knn_indices, knn_dists, []
 
-#        # Code as faiss is used by tsne-cuda.
-#        # It performs slower and is therefore not used
+#    # bruteForceKnn method. Performs as fast as simple version, but easily runs
+#    # into memory errors.
+#    n_samples = X.shape[0]
+#    n_dims = X.shape[1]
 
-#        from math import sqrt
+#    resource = faiss.StandardGpuResources()
+#    metric = faiss.METRIC_L2
 
-#        kNumCells = int(sqrt(float(n_samples)))
-#        kNumCellsToProbe = 20
+#    X_flat = np.ascontiguousarray(X).astype(np.float32)
+#    knn_dists = np.empty((n_samples, n_neighbors),dtype=np.float32)
+#    knn_indices = np.empty((n_samples, n_neighbors),dtype=np.int64)
 
-#        # Construct the GPU configuration object
-#        config = faiss.GpuIndexIVFFlatConfig()
-#        config.device = 0
-#        config.indicesOptions = faiss.INDICES_32_BIT
-#        config.flatConfig.useFloat16 = False
-#        config.useFloat16IVFStorage = False
+#    X_ptr = faiss.swig_ptr(X_flat)
+#    knn_indices_ptr = faiss.swig_ptr(knn_indices)
+#    knn_dists_ptr = faiss.swig_ptr(knn_dists)
 
-#        index = faiss.GpuIndexIVFFlat(resource, n_dims, kNumCells, faiss.METRIC_L2, config)
-#        index.setNumProbes(kNumCellsToProbe)
-#        index.train(X) #n_samples, points)
-#        index.add(X) #n_samples, points)
+#    faiss.bruteForceKnn(resource, metric, X_ptr, n_samples, X_ptr, n_samples, n_dims, n_neighbors, knn_dists_ptr, knn_indices_ptr)
 
-#        # Perform the KNN query
-#        knn_dists, knn_indices = index.search(X, n_neighbors)
+#    # FAISS outputs each point as closest to itself, but the rest of the code
+#    # does not seem to mind, so leaving them in place. Otherwise the first of
+#    # each indices row and distances rows would need to be removed.
+
+#    return knn_indices, knn_dists, []
+
+
+#    # Code as FAISS is used by t-SNE-CUDA. It performs slower then both methods
+#    # above and is therefore not used.
+#    # Requires: from math import sqrt
+
+#    n_samples = X.shape[0]
+#    n_dims = X.shape[1]
+#    X = np.ascontiguousarray(X.astype(np.float32))
+
+#    resource = faiss.StandardGpuResources()
+
+#    kNumCells = int(sqrt(float(n_samples)))
+#    kNumCellsToProbe = 20
+
+#    # Construct the GPU configuration object
+#    config = faiss.GpuIndexIVFFlatConfig()
+#    config.device = 0
+#    config.indicesOptions = faiss.INDICES_32_BIT
+#    config.flatConfig.useFloat16 = False
+#    config.useFloat16IVFStorage = False
+
+#    index = faiss.GpuIndexIVFFlat(resource, n_dims, kNumCells, faiss.METRIC_L2, config)
+#    index.setNumProbes(kNumCellsToProbe)
+#    index.train(X) #n_samples, points)
+#    index.add(X) #n_samples, points)
+
+#    # Perform the KNN query
+#    knn_dists, knn_indices = index.search(X, n_neighbors)
+#
+#    return knn_indices, knn_dists, []
 
