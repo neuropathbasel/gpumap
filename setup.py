@@ -16,7 +16,6 @@ configuration = {
         'License :: OSI Approved',
         'Programming Language :: C',
         'Programming Language :: Python',
-        'Programming Language :: CUDA',
         'Topic :: Software Development',
         'Topic :: Scientific/Engineering',
         'Operating System :: POSIX',
