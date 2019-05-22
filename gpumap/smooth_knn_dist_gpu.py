@@ -5,7 +5,11 @@
 from math import ceil, exp, fabs, floor
 
 import numpy as np
-from numba import cuda
+import cupy as cp
+from numba import cuda, float32
+
+N_ITER = 0
+MEAN_IS_ARRAY = False
 
 @cuda.jit(device=True)
 def calculate_rho(distances, local_connectivity, smooth_k_tolerance):
@@ -18,7 +22,7 @@ def calculate_rho(distances, local_connectivity, smooth_k_tolerance):
     non_zero_dist_at_index = 0.0
     non_zero_dist_at_index_minus_one = 0.0
     n_positive_distances = 0
-    
+
     for dist in distances:
         if dist > 0.0:
             max_non_zero_dist = max(dist, max_non_zero_dist)
@@ -30,7 +34,7 @@ def calculate_rho(distances, local_connectivity, smooth_k_tolerance):
             n_positive_distances += 1
     if n_positive_distances > 0:
         distances_mean /= float(n_positive_distances)
-    
+
     if n_positive_distances >= local_connectivity:
         interpolation = local_connectivity - index
         if index > 0:
@@ -47,13 +51,12 @@ def calculate_rho(distances, local_connectivity, smooth_k_tolerance):
 
 @cuda.jit(device=True)
 def binary_search_knn_dist(
-    distances, n_iter, rho_i, target, smooth_k_tolerance, 
+    distances, rho_i, target, smooth_k_tolerance,
 ):
     lo = 0.0
     hi = np.inf
     mid = 1.0
-
-    for n in range(n_iter):
+    for n in range(N_ITER):
         psum = 0.0
         for j in range(1, len(distances)):
             d = distances[j] - rho_i
@@ -79,9 +82,9 @@ def binary_search_knn_dist(
 
 @cuda.jit
 def smooth_knn_dist_cuda(
-        distances, rho, result, target, n_iter, local_connectivity,
-        distances_mean, smooth_k_tolerance, min_k_dist_scale
-    ):
+    distances, rho, result, target, local_connectivity, distances_mean,
+    smooth_k_tolerance, min_k_dist_scale
+):
     """Compute a continuous version of the distance to the kth nearest
     neighbor. That is, this is similar to knn-distance but allows continuous
     k values rather than requiring an integral k. In esscence we are simply
@@ -96,10 +99,6 @@ def smooth_knn_dist_cuda(
 
     k: float
         The number of nearest neighbors to approximate for.
-
-    n_iter: int (optional, default 64)
-        We need to binary search for the correct distance value. This is the
-        max number of iterations to use in such a search.
 
     local_connectivity: int (optional, default 1)
         The local connectivity required -- i.e. the number of nearest
@@ -128,30 +127,38 @@ def smooth_knn_dist_cuda(
         rho_i, ith_distances_mean = calculate_rho(
             ith_distances, local_connectivity, smooth_k_tolerance
         )
-        
+
         result_i = binary_search_knn_dist(
             ith_distances,
-            n_iter,
             rho_i,
-             target,
-              smooth_k_tolerance, 
+            target,
+            smooth_k_tolerance,
         )
 
-        if rho_i > 0.0:
-            result[i] = max(result_i, min_k_dist_scale * ith_distances_mean)
-        else:
-            result[i] = max(result_i, min_k_dist_scale * distances_mean)
         rho[i] = rho_i
+        if rho_i > 0.0:
+            mean = ith_distances_mean
+        else:
+            # FIXME related to cupy bug https://github.com/cupy/cupy/issues/2205
+            mean = distances_mean[0]
+        result[i] = max(result_i, min_k_dist_scale * mean)
+
 
 def smooth_knn_dist_gpu(
     distances, k, n_iter, local_connectivity, bandwidth, smooth_k_tolerance,
     min_k_dist_scale
 ):
-    rho = np.zeros(distances.shape[0])
-    result = np.zeros(distances.shape[0])
+    # set globals
+    global N_ITER
+    N_ITER = n_iter
+
+    # copy arrays
+    d_rho = cp.zeros(distances.shape[0], dtype=cp.float64)
+    d_result = cp.zeros(distances.shape[0], dtype=cp.float64)
+    d_distances = cp.asarray(distances)
 
     target = np.log2(k) * bandwidth
-    distances_mean = np.mean(distances)
+    distances_mean = cp.mean(d_distances)
 
     # define thread and block amounts
     #TODO test multiple values
@@ -159,19 +166,14 @@ def smooth_knn_dist_gpu(
     threads_per_block = 32
     n_blocks = n_threads // threads_per_block #use dividable values
 
-    # copy arrays
-    d_distances = cuda.to_device(distances)
-    d_rho = cuda.to_device(rho)
-    d_result = cuda.to_device(result)
-
     smooth_knn_dist_cuda[n_blocks, threads_per_block](
-        d_distances, d_rho, d_result, target, n_iter, local_connectivity,
+        d_distances, d_rho, d_result, target, local_connectivity,
         distances_mean, smooth_k_tolerance, min_k_dist_scale
     )
 
     # copy results back from device
-    result = d_result.copy_to_host()
-    rho = d_rho.copy_to_host()
+    result = cp.asnumpy(d_result)
+    rho = cp.asnumpy(d_rho)
 
     return result, rho
 
