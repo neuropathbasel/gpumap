@@ -25,7 +25,7 @@ INITIAL_ALPHA = 0.0
 
 MOVE_OTHER = True
 
-@cuda.jit("f4(f4)", device=True)
+@cuda.jit("f4(f4)", device=True, inline=True)
 def clip(val):
     """Standard clamping of a value into a fixed range (in this case -4.0 to
     4.0)
@@ -41,30 +41,8 @@ def clip(val):
     """
     return max(min(val, 4.0), -4.0)
 
-
-@cuda.jit("f4(f4[:],f4[:])", device=True)
-def rdist(x, y):
-    """Reduced Euclidean distance.
-
-    Parameters
-    ----------
-    x: array of shape (embedding_dim,)
-    y: array of shape (embedding_dim,)
-
-    Returns
-    -------
-    The squared euclidean distance between x and y
-    """
-    result = 0.0
-    for i in range(x.size):
-        tmp = x[i] - y[i]
-        result += tmp * tmp
-
-    return result
-
-
 @cuda.jit
-def optimize_layout_cuda_simple(
+def optimize_layout_cuda(
     write_embedding,
     read_embedding,
     head, # locally ascending
@@ -72,50 +50,61 @@ def optimize_layout_cuda_simple(
     epoch,
     epochs_per_sample,
     epoch_of_next_sample,
-    various_floats,
     rng_states,
 ):
-    # unpack from various_type
-    a = various_floats[0]
-    b = various_floats[1]
-    gamma = various_floats[2]
-    initial_alpha = various_floats[3]
-
-    move_other = write_embedding.shape[0] == read_embedding.shape[0]
-
     # edges handled by this thread
     thread_id = cuda.grid(1)
     n_threads = cuda.gridsize(1)
     thread_size = int(ceil(N_EDGES / n_threads))
-    start_edge = thread_id * thread_size
-    end_edge = min((thread_id + 1) * thread_size, N_EDGES)
+    current_edge = thread_id * thread_size
+    edge_end = min((thread_id + 1) * thread_size, N_EDGES)
+
+    #initiate local array
+    prefiltered = cuda.local.array(shape=(MAX_LOCAL), dtype=int32)
+
+    alpha = INITIAL_ALPHA * (1.0 - (epoch / N_EPOCHS))
 
     #iterate multiple times if local cache too small
-    alpha = initial_alpha * (1.0 - (epoch / N_EPOCHS))
+    while current_edge < edge_end:
+        #prefilter
+        count = 0
+        while current_edge < edge_end and count < MAX_LOCAL:
+            sample_edge = int(epoch_of_next_sample[current_edge] <= epoch)
+            epoch_of_next_sample[current_edge] += float(sample_edge) * epochs_per_sample[current_edge]
+            #store in local array
+            prefiltered[count] = current_edge
+            count += sample_edge
+            current_edge += 1
 
-    ## normal algorithm
-    for edge in range(start_edge, end_edge):
-        if epoch_of_next_sample[edge] <= epoch:
-            epoch_of_next_sample[edge] += epochs_per_sample[edge]
+        #all threads in block found up to max_local edges to sample
+#        cuda.syncthreads()
+
+        ## normal algorithm
+        for e in range(count):
+            edge = prefiltered[e]
 
             # load nodes for edge
             i = tail[edge]
-            current = write_embedding[i]
             j = head[edge]
+            current = write_embedding[i]
             other = read_embedding[j]
 
-            dist_squared = rdist(current, other)
+            dist_squared = 0.0
+            for d in range(N_DIMS):
+                tmp = current[d] - other[d]
+                dist_squared += tmp * tmp
 
             grad_coeff = 0.0
 
             if dist_squared > 0.0:
-                grad_coeff = -2.0 * a * b * pow(dist_squared, b - 1.0)
-                grad_coeff /= a * pow(dist_squared, b) + 1.0
+                grad_coeff = -2.0 * A * B * pow(dist_squared, B - 1.0)
+                grad_coeff /= A * pow(dist_squared, B) + 1.0
 
                 for d in range(N_DIMS):
                     grad_d = clip(grad_coeff * (current[d] - other[d]))
+
                     cuda.atomic.add(current, d, grad_d * alpha)
-                    if move_other:
+                    if MOVE_OTHER:
                         cuda.atomic.add(other, d, -grad_d * alpha)
 
             # negative sampling
@@ -129,230 +118,27 @@ def optimize_layout_cuda_simple(
 
                 other = read_embedding[k]
 
-                dist_squared = rdist(current, other)
-
-                grad_coeff = 0.0
-                grad_d = 4.0
-                if dist_squared > 0.0:
-                    grad_coeff = 2.0 * gamma * b
-                    grad_coeff /= (0.001 + dist_squared) * (
-                        a * pow(dist_squared, b) + 1.0
-                    )
-
-                for d in range(N_DIMS):
-                    if grad_coeff > 0.0:
-                        grad_d = clip(grad_coeff * (current[d] - other[d]))
-                    cuda.atomic.add(current, d, grad_d * alpha)
-
-@cuda.jit
-def optimize_layout_cuda_random(
-    write_embedding,
-    read_embedding,
-    head, # locally ascending
-    tail, # ascending
-    epoch,
-    epochs_per_sample,
-    epoch_of_next_sample,
-    various_floats,
-    rng_states,
-):
-    # unpack from various_type
-    a = various_floats[0]
-    b = various_floats[1]
-    gamma = various_floats[2]
-    initial_alpha = various_floats[3]
-
-    MOVE_OTHER = write_embedding.shape[0] == read_embedding.shape[0]
-
-    # edges handled by this thread
-    thread_id = cuda.grid(1)
-    block_thread_id = cuda.threadIdx.x
-    n_threads = cuda.gridsize(1)
-    thread_size = int(ceil(N_EDGES / n_threads))
-    current_edge = thread_id * thread_size
-    edge_end = min((thread_id + 1) * thread_size, N_EDGES)
-
-    #initiate local array
-    prefiltered = cuda.local.array(shape=(MAX_LOCAL), dtype=int32)
-
-    random = cuda.shared.array(shape=(1), dtype=int32)
-
-    #iterate multiple times if local cache too small
-    alpha = initial_alpha * (1.0 - (epoch / N_EPOCHS))
-    while current_edge <= edge_end:
-        #prefilter
-        count = 0
-        while current_edge <= edge_end and count < MAX_LOCAL:
-            sample_edge = int(epoch_of_next_sample[current_edge] <= epoch)
-            epoch_of_next_sample[current_edge] += float(sample_edge) * epochs_per_sample[current_edge]
-            #store in local array
-            prefiltered[count] = current_edge
-            count += sample_edge
-            current_edge += 1
-
-        #all threads in block found up to max_local edges to sample
-        cuda.syncthreads()
-
-        ## normal algorithm
-        for e in range(count):
-            edge = prefiltered[e]
-
-            # load nodes for edge
-            i = tail[edge]
-            current = write_embedding[i]
-            j = head[edge]
-            other = read_embedding[j]
-
-            dist_squared = rdist(current, other)
-
-            grad_coeff = 0.0
-
-            if dist_squared > 0.0:
-                grad_coeff = -2.0 * a * b * pow(dist_squared, b - 1.0)
-                grad_coeff /= a * pow(dist_squared, b) + 1.0
-
-                for d in range(N_DIMS):
-                    grad_d = clip(grad_coeff * (current[d] - other[d]))
-                    cuda.atomic.add(current, d, grad_d * alpha)
-                    if MOVE_OTHER:
-                        cuda.atomic.add(other, d, -grad_d * alpha)
-            cuda.syncthreads()
-
-            # negative sampling
-            for p in range(NEGATIVE_SAMPLE_RATE):
-                if block_thread_id == 0:
-                    random[0]=int(xoroshiro128p_uniform_float32(rng_states, cuda.blockIdx.x))
-
-                cuda.syncthreads()
-
-                # generate random number between 0 and N
-                k = (random[0] + block_thread_id) % N_VERTICES
-
-                # don't use self as negative sample
-                k = (k + int(k == i)) % N_VERTICES # += 1 if equal
-
-                other = read_embedding[k]
-
-                dist_squared = rdist(current, other)
-
-                grad_coeff = 0.0
-                grad_d = 4.0
-
-                if dist_squared > 0.0:
-                    grad_coeff = 2.0 * gamma * b
-                    grad_coeff /= (0.001 + dist_squared) * (
-                        a * pow(dist_squared, b) + 1.0
-                    )
-
-                for d in range(N_DIMS):
-                    if grad_coeff > 0.0:
-                        grad_d = clip(grad_coeff * (current[d] - other[d]))
-                    cuda.atomic.add(current, d, grad_d * alpha)
-
-                cuda.syncthreads()
-
-        cuda.syncthreads()
-
-
-@cuda.jit
-def optimize_layout_cuda(
-    write_embedding,
-    read_embedding,
-    head, # locally ascending
-    tail, # ascending
-    epochs_per_sample,
-    epoch_of_next_sample,
-    rng_states,
-):
-    # edges handled by this thread
-    thread_id = cuda.grid(1)
-    n_threads = cuda.gridsize(1)
-    thread_size = int(ceil(N_EDGES / n_threads))
-    start_edge = thread_id * thread_size
-    edge_end = min((thread_id + 1) * thread_size, N_EDGES)
-
-    #initiate local array
-    prefiltered = cuda.local.array(shape=(MAX_LOCAL), dtype=int32)
-
-    for epoch in range(N_EPOCHS):
-        current_edge = start_edge
-        alpha = INITIAL_ALPHA * (1.0 - (epoch / N_EPOCHS))
-
-        #iterate multiple times if local cache too small
-        while current_edge < edge_end:
-            #prefilter
-            count = 0
-            while current_edge < edge_end and count < MAX_LOCAL:
-                sample_edge = int(epoch_of_next_sample[current_edge] <= epoch)
-                epoch_of_next_sample[current_edge] += float(sample_edge) * epochs_per_sample[current_edge]
-                #store in local array
-                prefiltered[count] = current_edge
-                count += sample_edge
-                current_edge += 1
-
-            #all threads in block found up to max_local edges to sample
-            cuda.syncthreads()
-
-            ## normal algorithm
-            for e in range(count):
-                edge = prefiltered[e]
-
-                # load nodes for edge
-                i = tail[edge]
-                j = head[edge]
-                current = write_embedding[i]
-                other = read_embedding[j]
-
                 dist_squared = 0.0
                 for d in range(N_DIMS):
                     tmp = current[d] - other[d]
                     dist_squared += tmp * tmp
 
                 grad_coeff = 0.0
-
+                grad_d = 4.0
                 if dist_squared > 0.0:
-                    grad_coeff = -2.0 * A * B * pow(dist_squared, B - 1.0)
-                    grad_coeff /= A * pow(dist_squared, B) + 1.0
+                    grad_coeff = 2.0 * GAMMA * B
+                    grad_coeff /= (0.001 + dist_squared) * (
+                        A * pow(dist_squared, B) + 1.0
+                    )
 
-                    for d in range(N_DIMS):
+                for d in range(N_DIMS):
+                    if grad_coeff > 0.0:
                         grad_d = clip(grad_coeff * (current[d] - other[d]))
+                    cuda.atomic.add(current, d, grad_d * alpha)
 
-                        cuda.atomic.add(current, d, grad_d * alpha)
-                        if MOVE_OTHER:
-                            cuda.atomic.add(other, d, -grad_d * alpha)
-                cuda.syncthreads()
-
-                # negative sampling
-                for p in range(NEGATIVE_SAMPLE_RATE):
-                    # generate random number between 0 and N, not i or j
-                    k = (((((
-                        int(xoroshiro128p_uniform_float32(rng_states, thread_id))
-                        % (N_VERTICES - 2)) + i + 1)
-                        % (N_VERTICES  - 1)) + j + 1)
-                        % N_VERTICES)
-
-                    other = read_embedding[k]
-
-                    dist_squared = 0.0
-                    for d in range(N_DIMS):
-                        tmp = current[d] - other[d]
-                        dist_squared += tmp * tmp
-
-                    grad_coeff = 0.0
-                    grad_d = 4.0
-                    if dist_squared > 0.0:
-                        grad_coeff = 2.0 * GAMMA * B
-                        grad_coeff /= (0.001 + dist_squared) * (
-                            A * pow(dist_squared, B) + 1.0
-                        )
-
-                    for d in range(N_DIMS):
-                        if grad_coeff > 0.0:
-                            grad_d = clip(grad_coeff * (current[d] - other[d]))
-                        cuda.atomic.add(current, d, grad_d * alpha)
-
-            cuda.syncthreads()
         cuda.syncthreads()
+
+
 
 def optimize_layout_gpu(
     head_embedding,
@@ -372,8 +158,8 @@ def optimize_layout_gpu(
 ):
     # define thread and block amounts
     #TODO test multiple values
-    n_threads = 1024
-    threads_per_block = 32
+    n_threads = 8192
+    threads_per_block = 128
     n_blocks = n_threads // threads_per_block #use dividable values
 
     global N_DIMS, N_VERTICES, N_EDGES, N_EPOCHS, NEGATIVE_SAMPLE_RATE
@@ -417,16 +203,22 @@ def optimize_layout_gpu(
         end = time.time()
         print("Copying took {0} seconds".format(end-start))
 
+    start = time.time()
     # run on gpu
-    optimize_layout_cuda[n_blocks, threads_per_block](
-        d_head_embedding,
-        d_tail_embedding,
-        d_head,
-        d_tail,
-        d_epochs_per_sample,
-        d_epoch_of_next_sample,
-        d_rng_states,
-    )
+    for epoch in range(N_EPOCHS):
+        optimize_layout_cuda[n_blocks, threads_per_block](
+            d_head_embedding,
+            d_tail_embedding,
+            d_head,
+            d_tail,
+            epoch,
+            d_epochs_per_sample,
+            d_epoch_of_next_sample,
+            d_rng_states,
+        )
+
+    end = time.time()
+    print("optimize layout took", end-start)
 
     # copy result back from device
     head_embedding = d_head_embedding.copy_to_host()
