@@ -51,6 +51,7 @@ SMOOTH_K_TOLERANCE = 1e-5
 MIN_K_DIST_SCALE = 1e-3
 NPY_INFINITY = np.inf
 
+MAX_VERTICES_SPECTRAL = 100000
 
 def smooth_knn_dist(
     distances, k, n_iter=64, local_connectivity=1.0, bandwidth=1.0, use_gpu=True
@@ -1107,6 +1108,14 @@ def simplicial_set_embedding(
     graph.data[graph.data < (graph.data.max() / float(n_epochs))] = 0.0
     graph.eliminate_zeros()
 
+    if isinstance(init, str) and init == "default":
+        # Check size of data to embed. If bigger than x use random instead of
+        # spectral initialization
+        if n_vertices > MAX_VERTICES_SPECTRAL:
+            init = "random"
+        else:
+            init = "spectral"
+
     if isinstance(init, str) and init == "random":
         embedding = random_state.uniform(
             low=-10.0, high=10.0, size=(graph.shape[0], n_components)
@@ -1396,7 +1405,7 @@ class GPUMAP(BaseEstimator):
         metric="euclidean",
         n_epochs=None,
         learning_rate=1.0,
-        init="random",
+        init="default",
         min_dist=0.1,
         spread=1.0,
         set_op_mix_ratio=1.0,
@@ -1458,8 +1467,8 @@ class GPUMAP(BaseEstimator):
             raise ValueError("min_dist must be greater than 0.0")
         if not isinstance(self.init, str) and not isinstance(self.init, np.ndarray):
             raise ValueError("init must be a string or ndarray")
-        if isinstance(self.init, str) and self.init not in ("spectral", "random"):
-            raise ValueError('string init values must be "spectral" or "random"')
+        if isinstance(self.init, str) and self.init not in ("spectral", "random", "default"):
+            raise ValueError('string init values must be "spectral", "random" or "default"')
         if (
             isinstance(self.init, np.ndarray)
             and self.init.shape[1] != self.n_components
@@ -1616,14 +1625,17 @@ class GPUMAP(BaseEstimator):
                 self.use_gpu,
             )
 
-            self._search_graph = scipy.sparse.lil_matrix(
-                (X.shape[0], X.shape[0]), dtype=np.int8
-            )
-            self._search_graph.rows = self._knn_indices
-            self._search_graph.data = (self._knn_dists != 0).astype(np.int8)
-            self._search_graph = self._search_graph.maximum(
-                self._search_graph.transpose()
-            ).tocsr()
+            # GPU version does not use NN-Descent, so the search graph used for
+            # transform() is not needed and not stored.
+            if not self.use_gpu:
+                self._search_graph = scipy.sparse.lil_matrix(
+                    (X.shape[0], X.shape[0]), dtype=np.int8
+                )
+                self._search_graph.rows = self._knn_indices
+                self._search_graph.data = (self._knn_dists != 0).astype(np.int8)
+                self._search_graph = self._search_graph.maximum(
+                    self._search_graph.transpose()
+                ).tocsr()
 
             if callable(self.metric):
                 self._distance_func = self.metric
@@ -1721,8 +1733,6 @@ class GPUMAP(BaseEstimator):
         if self.verbose:
             print("Construct embedding")
 
-        self._input_hash = joblib.hash(self._raw_data)
-
         self.embedding_ = simplicial_set_embedding(
             self._raw_data,
             self.graph_,
@@ -1740,8 +1750,6 @@ class GPUMAP(BaseEstimator):
             self.verbose,
             self.use_gpu,
         )
-
-        self._input_hash = joblib.hash(self._raw_data)
 
         return self
 
@@ -1789,12 +1797,7 @@ class GPUMAP(BaseEstimator):
         if self.embedding_.shape[0] == 1:
             raise ValueError('Transform unavailable when model was fit with'
                              'only a single data sample.')
-        # If we just have the original input then short circuit things
-        X = check_array(X, dtype=np.float32, accept_sparse="csr")
-        x_hash = joblib.hash(X)
-        if x_hash == self._input_hash:
-            return self.embedding_
-
+        
         if self._sparse_data:
             raise ValueError("Transform not available for sparse input.")
         elif self.metric == 'precomputed':
