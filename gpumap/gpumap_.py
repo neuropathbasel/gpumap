@@ -46,6 +46,8 @@ locale.setlocale(locale.LC_NUMERIC, "C")
 
 import time
 
+from math import ceil
+
 INT32_MIN = np.iinfo(np.int32).min + 1
 INT32_MAX = np.iinfo(np.int32).max - 1
 
@@ -794,7 +796,7 @@ def general_simplicial_set_intersection(simplicial_set1, simplicial_set2, weight
 
 
 @numba.jit()
-def make_epochs_per_sample(weights, n_epochs):
+def make_epochs_per_sample(weights, n_epochs, use_gpu):
     """Given a set of weights and number of epochs generate the number of
     epochs per sample for each weight.
 
@@ -810,6 +812,22 @@ def make_epochs_per_sample(weights, n_epochs):
     -------
     An array of number of epochs per sample, one for each 1-simplex.
     """
+    if use_gpu:
+        fun = make_epochs_per_sample_gpu
+    else:
+        fun = make_epochs_per_sample_cpu
+    return fun(weights, n_epochs)
+
+
+def make_epochs_per_sample_gpu(weights, n_epochs):
+    result = -1.0 * cp.ones(weights.shape[0], dtype=cp.float32)
+    n_samples = n_epochs * (weights / weights.max())
+    result[n_samples > 0] = float(n_epochs) / n_samples[n_samples > 0]
+    return result
+
+
+@numba.jit()
+def make_epochs_per_sample_cpu(weights, n_epochs):
     result = -1.0 * np.ones(weights.shape[0], dtype=np.float64)
     n_samples = n_epochs * (weights / weights.max())
     result[n_samples > 0] = float(n_epochs) / n_samples[n_samples > 0]
@@ -1191,8 +1209,8 @@ def simplicial_set_embedding(
         The optimized of ``graph`` into an ``n_components`` dimensional
         euclidean space.
     """
-    use_gpu = False
     if use_gpu:
+        # TODO preserve array from fuzzy
         graph = cpx.scipy.sparse.coo_matrix(graph)
     graph = graph.tocoo()
     graph.sum_duplicates()
@@ -1222,16 +1240,19 @@ def simplicial_set_embedding(
         else:
             init = "spectral"
 
+    rng_states = random_state.randint(INT32_MIN, INT32_MAX, 3).astype(np.int64)
     if use_gpu:
-        rand_int = random_state.randint(0,N_THREADS)
-        rng_states = create_xoroshiro128p_states(N_THREADS, seed=rand_int)
-    else:
-        rng_states = random_state.randint(INT32_MIN, INT32_MAX, 3).astype(np.int64)
+        rng_states = create_xoroshiro128p_states(N_THREADS, seed=rng_states[0])
+
 
     if isinstance(init, str) and init == "random":
-        embedding = random_state.uniform(
-            low=-10.0, high=10.0, size=(graph.shape[0], n_components)
-        ).astype(np.float32)
+        if use_gpu:
+            embedding = cp.zeros((graph.shape[0], n_components), dtype=cp.float32)
+            random_init_gpu[N_BLOCKS, THREADS_PER_BLOCK](embedding, rng_states)
+        else:
+            embedding = random_state.uniform(
+                low=-10.0, high=10.0, size=(h_graph.shape[0], n_components)
+            ).astype(np.float32)
     elif isinstance(init, str) and init == "spectral":
         # We add a little noise to avoid local minima for optimization to come
         initialisation = spectral_layout_cpu(
@@ -1246,12 +1267,14 @@ def simplicial_set_embedding(
         embedding = (initialisation * expansion).astype(
             np.float32
         ) + random_state.normal(
-            scale=0.0001, size=[graph.shape[0], n_components]
+            scale=0.0001, size=[h_graph.shape[0], n_components]
         ).astype(
             np.float32
         )
+        print(type(embedding))
         if use_gpu:
             embedding = cp.asarray(embedding)
+        print(type(embedding))
     else:
         init_data = np.array(init)
         if len(init_data.shape) == 2:
@@ -1267,16 +1290,12 @@ def simplicial_set_embedding(
         if use_gpu:
             embedding = cp.asarray(embedding)
 
-    epochs_per_sample = make_epochs_per_sample(h_graph.data, n_epochs)
-    if use_gpu:
-        epochs_per_sample = cp.asarray(epochs_per_sample)
+    epochs_per_sample = make_epochs_per_sample(graph.data, n_epochs, use_gpu)
 
     head = graph.row
     tail = graph.col
 
-    use_gpu = True
-
-    embedding = optimize_layout(
+    return optimize_layout(
         embedding,
         embedding,
         head,
@@ -1293,8 +1312,6 @@ def simplicial_set_embedding(
         verbose=verbose,
         use_gpu=use_gpu,
     )
-    
-    return embedding
 
 
 @numba.njit()
@@ -1995,7 +2012,9 @@ class GPUMAP(BaseEstimator):
         graph.data[graph.data < (graph.data.max() / float(n_epochs))] = 0.0
         graph.eliminate_zeros()
 
-        epochs_per_sample = make_epochs_per_sample(graph.data, n_epochs)
+        epochs_per_sample = make_epochs_per_sample(
+            graph.data, n_epochs, self.use_gpu
+        )
 
         head = graph.row
         tail = graph.col

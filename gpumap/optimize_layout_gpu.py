@@ -141,7 +141,6 @@ def optimize_layout_cuda(
         cuda.syncthreads()
 
 
-
 def optimize_layout_gpu(
     head_embedding,
     tail_embedding,
@@ -182,16 +181,11 @@ def optimize_layout_gpu(
 
     # copy arrays to device
     start = time.time()
-    head_embedding = cp.asarray(head_embedding)
+#    head_embedding = cp.asarray(head_embedding)
     if MOVE_OTHER:
-        tail_embedding = cp.asarray(tail_embedding)
-    else:
-        tail_embedding = head_embedding
-    head = cp.asarray(head)
-    tail = cp.asarray(tail)
-    epochs_per_sample = cp.asarray(epochs_per_sample)
-    epoch_of_next_sample = cp.asarray(epochs_per_sample)
-    rng_states = create_xoroshiro128p_states(n_threads,seed=rng_states[0])
+        tail_embedding = cp.copy(head_embedding)
+
+    epoch_of_next_sample = cp.copy(epochs_per_sample)
 
     if verbose:
         end = time.time()
@@ -211,6 +205,8 @@ def optimize_layout_gpu(
             epoch_of_next_sample,
             rng_states,
         )
+    head_embedding[0] = 0.0
+    head_embedding[N_VERTICES-1] = 0.0
 
     # copy result back from device
     return head_embedding.get()
