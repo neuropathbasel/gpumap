@@ -182,46 +182,36 @@ def optimize_layout_gpu(
 
     # copy arrays to device
     start = time.time()
-    d_head_embedding = cuda.to_device(head_embedding)
-
+    head_embedding = cp.asarray(head_embedding)
     if MOVE_OTHER:
-        d_tail_embedding = cuda.to_device(tail_embedding)
+        tail_embedding = cp.asarray(tail_embedding)
     else:
-        d_tail_embedding = d_head_embedding
+        tail_embedding = head_embedding
+    head = cp.asarray(head)
+    tail = cp.asarray(tail)
+    epochs_per_sample = cp.asarray(epochs_per_sample)
+    epoch_of_next_sample = cp.asarray(epochs_per_sample)
+    rng_states = create_xoroshiro128p_states(n_threads,seed=rng_states[0])
 
-    d_head = cuda.to_device(head)
-    d_tail = cuda.to_device(tail)
-
-    d_epochs_per_sample = cuda.to_device(epochs_per_sample)
-    d_epoch_of_next_sample = cuda.to_device(epochs_per_sample)
-
-    d_rng_states = create_xoroshiro128p_states(n_threads,seed=rng_states[0])
-
-    # sanitize negative sample rate
-    if verbose and negative_sample_rate != int(negative_sample_rate):
-        print("rounding negative sample rate to ", int(negative_sample_rate))
+    if verbose:
+        end = time.time()
+        print("Copying took {0} seconds".format(end-start))
 
     epoch_of_next_sample = cp.copy(epochs_per_sample)
 
-    start = time.time()
     # run on gpu
     for epoch in range(N_EPOCHS):
         optimize_layout_cuda[n_blocks, threads_per_block](
-            d_head_embedding,
-            d_tail_embedding,
-            d_head,
-            d_tail,
+            head_embedding,
+            tail_embedding,
+            head,
+            tail,
             epoch,
-            d_epochs_per_sample,
-            d_epoch_of_next_sample,
-            d_rng_states,
+            epochs_per_sample,
+            epoch_of_next_sample,
+            rng_states,
         )
 
-    end = time.time()
-    print("optimize layout took", end-start)
-
     # copy result back from device
-#    head_embedding = d_head_embedding.copy_to_host()
-
-    return d_head_embedding.copy_to_host()
+    return head_embedding.get()
 

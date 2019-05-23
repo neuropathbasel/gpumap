@@ -43,9 +43,6 @@ def compute_membership_strengths_gpu(
     N_SAMPLES   = d_knn_indices.shape[0]
     N_NEIGHBORS = d_knn_indices.shape[1]
 
-    print(N_SAMPLES)
-    print(N_NEIGHBORS)
-
     # create new device arrays
     array_size = N_SAMPLES * N_NEIGHBORS
     d_rows = cp.zeros((array_size), dtype=cp.int64)

@@ -151,15 +151,13 @@ def smooth_knn_dist_gpu(
     # set globals
     global N_ITER
     N_ITER = n_iter
-    
-    d_distances = cp.asarray(distances)
 
     # create new device arrays
-    d_rho = cp.zeros(d_distances.shape[0], dtype=cp.float64)
-    d_result = cp.zeros(d_distances.shape[0], dtype=cp.float64)
+    rho = cp.zeros(distances.shape[0], dtype=cp.float64)
+    result = cp.zeros(distances.shape[0], dtype=cp.float64)
 
     target = np.log2(k) * bandwidth
-    distances_mean = cp.mean(d_distances)
+    distances_mean = cp.mean(distances)
 
     # define thread and block amounts
     #TODO test multiple values
@@ -168,16 +166,16 @@ def smooth_knn_dist_gpu(
     n_blocks = n_threads // threads_per_block #use dividable values
 
     smooth_knn_dist_cuda[n_blocks, threads_per_block](
-        d_distances, d_rho, d_result, target, local_connectivity,
+        distances, rho, result, target, local_connectivity,
         distances_mean, smooth_k_tolerance, min_k_dist_scale
     )
 
 #    result = cp.asnumpy(d_result)
 #    return d_result, d_rho
 
-    # copy results back from device
-    result = cp.asnumpy(d_result)
-    rho = cp.asnumpy(d_rho)
+#    # copy results back from device
+#    result = cp.asnumpy(d_result)
+#    rho = cp.asnumpy(d_rho)
 
     return result, rho
 

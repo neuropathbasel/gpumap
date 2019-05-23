@@ -15,15 +15,16 @@ from sklearn.neighbors import KDTree
 from sklearn.externals import joblib
 
 import numpy as np
+import cupy as cp
+import cupyx as cpx
 import scipy.sparse
 import scipy.sparse.csgraph
 import numba
 from numba import cuda
+from numba.cuda.random import xoroshiro128p_uniform_float32, create_xoroshiro128p_states
 
 import gpumap.distances as dist
-
 import gpumap.sparse as sparse
-
 from gpumap.utils import tau_rand_int, deheap_sort, submatrix
 from gpumap.rp_tree import rptree_leaf_array, make_forest
 from gpumap.nndescent import (
@@ -34,9 +35,10 @@ from gpumap.nndescent import (
 )
 from gpumap.spectral import spectral_layout_cpu
 
-from gpumap.optimize_layout_gpu import optimize_layout_gpu
 from gpumap.nearest_neighbors_gpu import nearest_neighbors_gpu
 from gpumap.smooth_knn_dist_gpu import smooth_knn_dist_gpu
+from gpumap.compute_membership_strengths_gpu import compute_membership_strengths_gpu
+from gpumap.optimize_layout_gpu import optimize_layout_gpu
 
 import locale
 
@@ -52,6 +54,26 @@ MIN_K_DIST_SCALE = 1e-3
 NPY_INFINITY = np.inf
 
 MAX_VERTICES_SPECTRAL = 100000
+
+N_THREADS = 8192
+THREADS_PER_BLOCK = 128
+N_BLOCKS = N_THREADS // THREADS_PER_BLOCK
+
+
+@cuda.jit()
+def random_init_gpu(embedding, rng_states):
+    n_vertices = embedding.shape[0]
+    # values handled by this thread
+    thread_id = cuda.grid(1)
+    thread_size = int(ceil(n_vertices / N_THREADS))
+    start = thread_id * thread_size
+    end = min((thread_id + 1) * thread_size, n_vertices)
+
+    for i in range(start, end):
+        for j in range(embedding.shape[1]):
+            rand = xoroshiro128p_uniform_float32(rng_states, thread_id)
+            embedding[i][j] = (rand - 0.5) * 20.0
+
 
 def smooth_knn_dist(
     distances, k, n_iter=64, local_connectivity=1.0, bandwidth=1.0, use_gpu=True
@@ -344,8 +366,7 @@ def nearest_neighbors_cpu(
     return knn_indices, knn_dists, rp_forest
 
 
-@numba.njit(parallel=True, fastmath=True)
-def compute_membership_strengths(knn_indices, knn_dists, sigmas, rhos):
+def compute_membership_strengths(knn_indices, knn_dists, sigmas, rhos, use_gpu):
     """Construct the membership strength data for the 1-skeleton of each local
     fuzzy simplicial set -- this is formed as a sparse matrix where each row is
     a local fuzzy simplicial set, with a membership strength for the
@@ -376,6 +397,15 @@ def compute_membership_strengths(knn_indices, knn_dists, sigmas, rhos):
     vals: array of shape (n_samples * n_neighbors)
         Entries for the resulting sparse matrix (coo format)
     """
+    if use_gpu:
+        fun = compute_membership_strengths_gpu
+    else:
+        fun = compute_membership_strengths_cpu
+
+    return fun(knn_indices, knn_dists, sigmas, rhos)
+
+@numba.njit(parallel=True, fastmath=True)
+def compute_membership_strengths_cpu(knn_indices, knn_dists, sigmas, rhos):
     n_samples = knn_indices.shape[0]
     n_neighbors = knn_indices.shape[1]
 
@@ -401,7 +431,6 @@ def compute_membership_strengths(knn_indices, knn_dists, sigmas, rhos):
     return rows, cols, vals
 
 
-@numba.jit()
 def fuzzy_simplicial_set(
     X,
     n_neighbors,
@@ -522,6 +551,74 @@ def fuzzy_simplicial_set(
         j) entry of the matrix represents the membership strength of the
         1-simplex between the ith and jth sample points.
     """
+    if use_gpu:
+        fun = fuzzy_simplicial_set_gpu
+    else:
+        fun = fuzzy_simplicial_set_cpu
+    return fun(X, n_neighbors, random_state, metric, metric_kwds, knn_indices,
+        knn_dists, angular, set_op_mix_ratio, local_connectivity, verbose)
+
+
+def fuzzy_simplicial_set_gpu(
+    X, n_neighbors, random_state, metric, metric_kwds, knn_indices, knn_dists,
+    angular, set_op_mix_ratio, local_connectivity, verbose
+):
+    if knn_indices is None or knn_dists is None:
+        knn_indices, knn_dists, _ = nearest_neighbors(
+            X, n_neighbors, metric, metric_kwds, angular, random_state, verbose,
+            use_gpu
+        )
+
+    # TODO keep KNN results on device
+    knn_indices = cp.asarray(knn_indices)
+    knn_dists = cp.asarray(knn_dists)
+
+    sigmas, rhos = smooth_knn_dist(
+        knn_dists, n_neighbors, local_connectivity=local_connectivity,
+        use_gpu=True
+    )
+
+    rows, cols, vals = compute_membership_strengths_gpu(
+        knn_indices, knn_dists, sigmas, rhos
+    )
+
+    result = cpx.scipy.sparse.coo_matrix(
+        (vals, (rows, cols)), shape=(X.shape[0], X.shape[0])
+    )
+
+    result.eliminate_zeros()
+
+    transpose = result.transpose()
+
+    h_result = result.get()
+    h_transpose = transpose.get()
+
+    #TODO do this on GPU somehow? write own kernel that can handle coo matrices?
+    h_prod_matrix = h_result.multiply(h_transpose)
+
+    result = (
+        set_op_mix_ratio * (h_result + h_transpose - h_prod_matrix)
+        + (1.0 - set_op_mix_ratio) * h_prod_matrix
+    )
+
+    result.eliminate_zeros()
+
+    return result
+
+@numba.jit()
+def fuzzy_simplicial_set_cpu(
+    X,
+    n_neighbors,
+    random_state,
+    metric,
+    metric_kwds={},
+    knn_indices=None,
+    knn_dists=None,
+    angular=False,
+    set_op_mix_ratio=1.0,
+    local_connectivity=1.0,
+    verbose=False,
+):
     if knn_indices is None or knn_dists is None:
         knn_indices, knn_dists, _ = nearest_neighbors(
             X, n_neighbors, metric, metric_kwds, angular, random_state, verbose,
@@ -530,10 +627,10 @@ def fuzzy_simplicial_set(
 
     sigmas, rhos = smooth_knn_dist(
         knn_dists, n_neighbors, local_connectivity=local_connectivity,
-        use_gpu=use_gpu
+        use_gpu=False
     )
 
-    rows, cols, vals = compute_membership_strengths(
+    rows, cols, vals = compute_membership_strengths_cpu(
         knn_indices, knn_dists, sigmas, rhos
     )
 
@@ -1094,6 +1191,9 @@ def simplicial_set_embedding(
         The optimized of ``graph`` into an ``n_components`` dimensional
         euclidean space.
     """
+    use_gpu = False
+    if use_gpu:
+        graph = cpx.scipy.sparse.coo_matrix(graph)
     graph = graph.tocoo()
     graph.sum_duplicates()
     n_vertices = graph.shape[1]
@@ -1108,6 +1208,12 @@ def simplicial_set_embedding(
     graph.data[graph.data < (graph.data.max() / float(n_epochs))] = 0.0
     graph.eliminate_zeros()
 
+    if use_gpu:
+        #TODO parallelize eigenvalue calculation in spectral_layout_gpu
+        h_graph = graph.get()
+    else:
+        h_graph = graph
+
     if isinstance(init, str) and init == "default":
         # Check size of data to embed. If bigger than x use random instead of
         # spectral initialization
@@ -1115,6 +1221,12 @@ def simplicial_set_embedding(
             init = "random"
         else:
             init = "spectral"
+
+    if use_gpu:
+        rand_int = random_state.randint(0,N_THREADS)
+        rng_states = create_xoroshiro128p_states(N_THREADS, seed=rand_int)
+    else:
+        rng_states = random_state.randint(INT32_MIN, INT32_MAX, 3).astype(np.int64)
 
     if isinstance(init, str) and init == "random":
         embedding = random_state.uniform(
@@ -1124,7 +1236,7 @@ def simplicial_set_embedding(
         # We add a little noise to avoid local minima for optimization to come
         initialisation = spectral_layout_cpu(
             data,
-            graph,
+            h_graph,
             n_components,
             random_state,
             metric=metric,
@@ -1138,6 +1250,8 @@ def simplicial_set_embedding(
         ).astype(
             np.float32
         )
+        if use_gpu:
+            embedding = cp.asarray(embedding)
     else:
         init_data = np.array(init)
         if len(init_data.shape) == 2:
@@ -1150,13 +1264,17 @@ def simplicial_set_embedding(
                 ).astype(np.float32)
             else:
                 embedding = init_data
+        if use_gpu:
+            embedding = cp.asarray(embedding)
 
-    epochs_per_sample = make_epochs_per_sample(graph.data, n_epochs)
+    epochs_per_sample = make_epochs_per_sample(h_graph.data, n_epochs)
+    if use_gpu:
+        epochs_per_sample = cp.asarray(epochs_per_sample)
 
     head = graph.row
     tail = graph.col
 
-    rng_state = random_state.randint(INT32_MIN, INT32_MAX, 3).astype(np.int64)
+    use_gpu = True
 
     embedding = optimize_layout(
         embedding,
@@ -1168,7 +1286,7 @@ def simplicial_set_embedding(
         epochs_per_sample,
         a,
         b,
-        rng_state,
+        rng_states,
         gamma=gamma,
         initial_alpha=initial_alpha,
         negative_sample_rate=negative_sample_rate,
@@ -1576,6 +1694,10 @@ class GPUMAP(BaseEstimator):
         random_state = check_random_state(self.random_state)
 
         if self.verbose:
+            print("All checks passed.")
+            if self.use_gpu:
+                dev = cuda.get_current_device()
+                print("Running on", str(dev.name, 'utf-8'))
             print("Construct fuzzy simplicial set")
 
         # Handle small cases efficiently by computing all distances

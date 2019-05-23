@@ -3,6 +3,8 @@
 # License: BSD 3 clause
 import numpy as np
 
+from math import sqrt, ceil
+
 import faiss
 
 # Implementation based on
@@ -31,11 +33,12 @@ def nearest_neighbors_gpu(X, n_neighbors):
     knn_dists: array of shape (n_samples, n_neighbors)
         The distances to the ``n_neighbors`` closest points in the dataset.
     """
+    n_samples = X.shape[0]
+    n_dims = X.shape[1]
+
     # Simple implementation. Basically also brute force, but does not need as
     # much memory as bruteForceKnn for unknown reasons. Performs maybe half a
     # second slower for small data sets
-    n_samples = X.shape[0]
-    n_dims = X.shape[1]
 
     # assure that data is contiguous, otherwise FAISS can not process it
     X = np.ascontiguousarray(X.astype(np.float32))
@@ -45,12 +48,30 @@ def nearest_neighbors_gpu(X, n_neighbors):
     index = faiss.GpuIndexFlatL2(resource, n_dims)
     index.train(X)
     index.add(X)
-    knn_dists, knn_indices = index.search(X, n_neighbors)
+
+    #knn_dists, knn_indices = index.search(X, n_neighbors)
+
+    # query in batches above certain limit
+    # TODO determine limit, requires to known device memory size, possible input
+    if n_samples < 500000 :
+        knn_dists, knn_indices = index.search(X, n_neighbors)
+    else:
+        # query 5 times, since FAISS reserves approximately 18% of memory as
+        # temporary memory and thus querying 5 times always allows each query
+        # to fit in memory
+        n_queries = 5
+        slice_size = ceil(n_samples / n_queries)
+        knn_dists = np.zeros((n_samples, n_neighbors), dtype=np.float32)
+        knn_indices = np.zeros((n_samples, n_neighbors), dtype=np.int64)
+        for i in range(n_queries):
+            start = i * slice_size
+            end = min(start + slice_size, n_samples)
+            knn_dists[start:end], knn_indices[start:end] = index.search(X[start:end], n_neighbors)
 
     return knn_indices, knn_dists, []
 
-#    # bruteForceKnn method. Performs as fast as simple version, but easily runs
-#    # into memory errors.
+    # bruteForceKnn method. Performs as fast as simple version, but easily runs
+    # into memory errors.
 #    n_samples = X.shape[0]
 #    n_dims = X.shape[1]
 
@@ -74,12 +95,9 @@ def nearest_neighbors_gpu(X, n_neighbors):
 #    return knn_indices, knn_dists, []
 
 
-#    # Code as FAISS is used by t-SNE-CUDA. It performs slower then both methods
-#    # above and is therefore not used.
-#    # Requires: from math import sqrt
-
-#    n_samples = X.shape[0]
-#    n_dims = X.shape[1]
+    # Code as FAISS is used by t-SNE-CUDA. It performs slower then both methods
+    # above and is therefore not used.
+    # Requires: from math import sqrt
 #    X = np.ascontiguousarray(X.astype(np.float32))
 
 #    resource = faiss.StandardGpuResources()
@@ -101,6 +119,7 @@ def nearest_neighbors_gpu(X, n_neighbors):
 
 #    # Perform the KNN query
 #    knn_dists, knn_indices = index.search(X, n_neighbors)
-#
+
 #    return knn_indices, knn_dists, []
+
 
