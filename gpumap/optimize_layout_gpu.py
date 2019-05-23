@@ -11,7 +11,7 @@ from numba.cuda.random import xoroshiro128p_uniform_float32, create_xoroshiro128
 import locale
 import time
 
-MAX_LOCAL = 16
+MAX_LOCAL = 32
 
 # used as constants during compilation, allowing loop unrolling
 N_VERTICES = 0
@@ -179,18 +179,11 @@ def optimize_layout_gpu(
     global MOVE_OTHER
     MOVE_OTHER = head_embedding.shape[0] == tail_embedding.shape[0]
 
-    # copy arrays to device
-    start = time.time()
-#    head_embedding = cp.asarray(head_embedding)
+    # create remaining arrays
     if MOVE_OTHER:
         tail_embedding = cp.copy(head_embedding)
-
-    epoch_of_next_sample = cp.copy(epochs_per_sample)
-
-    if verbose:
-        end = time.time()
-        print("Copying took {0} seconds".format(end-start))
-
+    else:
+        tail_embedding = cp.asarray(tail_embedding)
     epoch_of_next_sample = cp.copy(epochs_per_sample)
 
     # run on gpu
@@ -205,8 +198,6 @@ def optimize_layout_gpu(
             epoch_of_next_sample,
             rng_states,
         )
-    head_embedding[0] = 0.0
-    head_embedding[N_VERTICES-1] = 0.0
 
     # copy result back from device
     return head_embedding.get()
