@@ -32,7 +32,7 @@ from gpumap.nndescent import (
     make_initialized_nnd_search,
     initialise_search,
 )
-from gpumap.spectral import spectral_layout
+from gpumap.spectral import spectral_layout_cpu
 
 from gpumap.optimize_layout_gpu import optimize_layout_gpu
 from gpumap.nearest_neighbors_gpu import nearest_neighbors_gpu
@@ -1122,7 +1122,7 @@ def simplicial_set_embedding(
         ).astype(np.float32)
     elif isinstance(init, str) and init == "spectral":
         # We add a little noise to avoid local minima for optimization to come
-        initialisation = spectral_layout(
+        initialisation = spectral_layout_cpu(
             data,
             graph,
             n_components,

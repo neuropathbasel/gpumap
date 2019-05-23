@@ -196,7 +196,7 @@ def multi_component_layout(
     return result
 
 
-def spectral_layout(data, graph, dim, random_state, metric="euclidean", metric_kwds={}):
+def spectral_layout_cpu(data, graph, dim, random_state, metric="euclidean", metric_kwds={}):
     """Given a graph compute the spectral embedding of the graph. This is
     simply the eigenvectors of the laplacian of the graph. Here we use the
     normalized laplacian.

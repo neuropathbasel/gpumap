@@ -3,6 +3,8 @@
 # License: BSD 3 clause
 from math import pow, ceil
 
+import cupy as cp
+
 from numba import cuda, int32
 from numba.cuda.random import xoroshiro128p_uniform_float32, create_xoroshiro128p_states
 
@@ -150,7 +152,7 @@ def optimize_layout_gpu(
     epochs_per_sample,
     a,
     b,
-    rng_state,
+    rng_states,
     gamma,
     initial_alpha,
     negative_sample_rate,
@@ -178,10 +180,6 @@ def optimize_layout_gpu(
     global MOVE_OTHER
     MOVE_OTHER = head_embedding.shape[0] == tail_embedding.shape[0]
 
-    # sanitize negative sample rate
-    if verbose and negative_sample_rate != int(negative_sample_rate):
-        print("rounding negative sample rate to ", int(negative_sample_rate))
-
     # copy arrays to device
     start = time.time()
     d_head_embedding = cuda.to_device(head_embedding)
@@ -197,11 +195,13 @@ def optimize_layout_gpu(
     d_epochs_per_sample = cuda.to_device(epochs_per_sample)
     d_epoch_of_next_sample = cuda.to_device(epochs_per_sample)
 
-    d_rng_states = create_xoroshiro128p_states(n_threads,seed=rng_state[0])
+    d_rng_states = create_xoroshiro128p_states(n_threads,seed=rng_states[0])
 
-    if verbose:
-        end = time.time()
-        print("Copying took {0} seconds".format(end-start))
+    # sanitize negative sample rate
+    if verbose and negative_sample_rate != int(negative_sample_rate):
+        print("rounding negative sample rate to ", int(negative_sample_rate))
+
+    epoch_of_next_sample = cp.copy(epochs_per_sample)
 
     start = time.time()
     # run on gpu
@@ -221,7 +221,7 @@ def optimize_layout_gpu(
     print("optimize layout took", end-start)
 
     # copy result back from device
-    head_embedding = d_head_embedding.copy_to_host()
+#    head_embedding = d_head_embedding.copy_to_host()
 
-    return head_embedding
+    return d_head_embedding.copy_to_host()
 
