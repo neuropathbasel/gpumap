@@ -568,7 +568,7 @@ def fuzzy_simplicial_set_gpu(
     if knn_indices is None or knn_dists is None:
         knn_indices, knn_dists, _ = nearest_neighbors(
             X, n_neighbors, metric, metric_kwds, angular, random_state, verbose,
-            use_gpu
+            use_gpu=True
         )
 
     # TODO keep KNN results on device
@@ -624,7 +624,7 @@ def fuzzy_simplicial_set_cpu(
     if knn_indices is None or knn_dists is None:
         knn_indices, knn_dists, _ = nearest_neighbors(
             X, n_neighbors, metric, metric_kwds, angular, random_state, verbose,
-            use_gpu
+            use_gpu=False
         )
 
     sigmas, rhos = smooth_knn_dist(
@@ -1218,10 +1218,16 @@ def simplicial_set_embedding(
 
     if n_epochs <= 0:
         # For smaller datasets we can use more epochs
-        if graph.shape[0] <= 10000:
-            n_epochs = 500
+        if use_gpu:
+            if graph.shape[0] <= 10000:
+                n_epochs = 1000
+            else:
+                n_epochs = 600
         else:
-            n_epochs = 200
+            if graph.shape[0] <= 10000:
+                n_epochs = 500
+            else:
+                n_epochs = 200
 
     graph.data[graph.data < (graph.data.max() / float(n_epochs))] = 0.0
     graph.eliminate_zeros()
@@ -1271,10 +1277,8 @@ def simplicial_set_embedding(
         ).astype(
             np.float32
         )
-        print(type(embedding))
         if use_gpu:
             embedding = cp.asarray(embedding)
-        print(type(embedding))
     else:
         init_data = np.array(init)
         if len(init_data.shape) == 2:
