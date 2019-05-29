@@ -1,7 +1,7 @@
 # Author: Peter Eisenmann
 #
 # License: BSD 3 clause
-from math import pow, ceil
+from math import pow, ceil, floor
 
 import cupy as cp
 import cupy as cp
@@ -21,8 +21,6 @@ N_DIMS = 0
 N_EDGES = 0
 N_EPOCHS = 0
 NEGATIVE_SAMPLE_RATE = 0
-
-THREAD_SIZE = 0
 
 A = 0.0
 B = 0.0
@@ -61,8 +59,10 @@ def optimize_layout_cuda(
     # edges handled by this thread
     thread_id = cuda.grid(1)
     n_threads = cuda.gridsize(1)
-    current_edge = thread_id * THREAD_SIZE
-    end_edge = min(current_edge + THREAD_SIZE, N_EDGES)
+    thread_size = int(floor(N_EDGES / n_threads))
+    offset = N_EDGES % n_threads
+    current_edge = thread_id * thread_size + min(offset, thread_id)
+    end_edge = (thread_id + 1) * thread_size + min(offset, thread_id + 1)
 
     #initiate local array
     prefiltered = cuda.local.array(shape=(MAX_LOCAL), dtype=int32)
@@ -72,7 +72,7 @@ def optimize_layout_cuda(
 
     # init cache
     start_node = tail[current_edge]
-    end_node = tail[min(end_edge - 1, 0)]
+    end_node = tail[max(end_edge - 1, 0)]
     cached_i = start_node
     for d in range(N_DIMS):
         cached[d] = read_embedding[cached_i][d]
@@ -190,13 +190,12 @@ def optimize_layout_gpu(
     threads_per_block = 128
     n_blocks = n_threads // threads_per_block #use dividable values
 
-    global N_DIMS, N_VERTICES, N_EDGES, N_EPOCHS, NEGATIVE_SAMPLE_RATE, THREAD_SIZE
+    global N_DIMS, N_VERTICES, N_EDGES, N_EPOCHS, NEGATIVE_SAMPLE_RATE
     N_VERTICES = head_embedding.shape[0]
     N_DIMS = head_embedding.shape[1]
     N_EDGES = head.shape[0]
     N_EPOCHS = n_epochs
     NEGATIVE_SAMPLE_RATE = int(negative_sample_rate)
-    THREAD_SIZE = int(ceil(N_EDGES / n_threads))
 
     global A, B, GAMMA, INITIAL_ALPHA
     A = a
@@ -240,6 +239,8 @@ def optimize_layout_gpu(
 
         if verbose and epoch % int(N_EPOCHS / 10) == 0:
             print("\tcompleted ", epoch, " / ", N_EPOCHS, "epochs")
+    if verbose:
+        print("\tcompleted ", N_EPOCHS, " / ", N_EPOCHS, "epochs")
 
     return write_embedding.get()
 
