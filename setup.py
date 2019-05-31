@@ -6,7 +6,7 @@ def readme():
 
 configuration = {
     'name' : 'gpumap',
-    'version': '0.0.1',
+    'version': '0.1.0',
     'description' : 'UMAP with GPUs',
     'long_description' : readme(),
     'classifiers' : [
@@ -22,7 +22,7 @@ configuration = {
         'Operating System :: Unix',
         'Operating System :: MacOS',
         'Programming Language :: Python :: 2.7',
-        'Programming Language :: Python :: 3.6',
+        'Programming Language :: Python :: 3.7',
     ],
     'keywords' : 'dimension reduction t-sne manifold umap',
     'url' : 'http://github.com/p3732/gpumap',
