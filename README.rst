@@ -94,7 +94,9 @@ nearest-neighbor search on GPUs.
 
 **Install Options**
 
-** Option 1: Conda **
+GPUMAP can be installed via Conda, PyPi or from source:
+
+**Option 1: Conda**
 
 Set up a new conda environment, if needed.
 
@@ -111,6 +113,7 @@ Install dependecies: Numba and FAISS
 .. code:: bash
 
     conda install numba
+    conda install scikit-learn
 
     conda install faiss-gpu cudatoolkit=10.0 -c pytorch # For CUDA10
     # For older CUDA versions:
@@ -129,7 +132,7 @@ GPUMAP is also available as a PyPi package.
 
 Note that the prebuilt FAISS library is not officially supported by upstream.
 
-** Option 3: Build **
+**Option 3: Build**
 
 Building from source is easy, clone the repository or get the code onto your
 computer by other means and run the installer with:
@@ -154,3 +157,4 @@ Contributing
 ------------
 
 Contributions are always welcome! Fork away!
+
