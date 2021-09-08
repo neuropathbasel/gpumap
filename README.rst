@@ -98,7 +98,7 @@ computer by other means, install the
 
 .. code:: bash
 
-    pip install --upgrade-pip
+    pip install --upgrade pip
     pip install cupy-cuda102==9.0.0rc1
     pip install faiss-gpu==1.7.1.post2
     pip install numpy==1.20.2
