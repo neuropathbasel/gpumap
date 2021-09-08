@@ -120,7 +120,7 @@ computer by other means, install the
     python setup.py install
 
 Note that the dependecies need to be installed beforehand. Then test, is the installation
-is working with the script. You will probably get deprecation warnings.
+is working with the included test script. You will probably get deprecation warnings.
 
 .. code:: bash
 
