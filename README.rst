@@ -73,11 +73,23 @@ nearest-neighbor search on GPUs.
 * (numpy)
 * (scipy)
 * numba
-* faiss
+* faiss-gpu
 
 **Install Options**
 
-GPUMAP can be installed from source, depencies via pip, preferably in a python 3.7 virtual environment
+GPUMAP needs to be installed from source, depencies via pip, preferably in a python 3.7 virtual environment,
+which can be created on the following way, e.g., in /applications/gpumap:
+
+.. code:: bash
+ 
+    venvname=gpumap
+    venvpath=/applications/
+    mypython=python3.7
+    
+    cd $venvpath
+    $mypython -m venv $venvname
+    source $venvpath/$venvname/bin/activate
+
 
 **Build**
 
