@@ -1,3 +1,5 @@
+see README.2nd, quick fix to facilitate installation with CUDA 10.2 (Sept 2021)
+
 ======
 GPUMAP
 ======
