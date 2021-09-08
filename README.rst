@@ -54,6 +54,7 @@ cause a fallback to the sequential version for parts of the algorithm.
 ------------------------
 Performance and Examples
 ------------------------
+
 See `https://github.com/p3732/gpumap`.
 
 Testing was done with an RTX2070 and Intel Xeon CPUs.
@@ -88,6 +89,7 @@ x86_46 only (so far). The following repository has been used (added to /etc/apt/
     deb http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/ /
     
 .. code:: bash
+
     sudo apt update
     sudo apt install cuda cuda-10-0 cuda-10-2
 
@@ -95,6 +97,7 @@ Building from source is easy, clone the repository or get the code onto your
 computer by other means, install the 
 
 .. code:: bash
+
     pip install --upgrade-pip
     pip install cupy-cuda102==9.0.0rc1
     pip install faiss-gpu==1.7.1.post2
