@@ -123,6 +123,7 @@ Note that the dependecies need to be installed beforehand. Then test, is the ins
 is working with the script. You will probably get deprecation warnings.
 
 .. code:: bash
+
     python test_gpumap.py
 
 -------
