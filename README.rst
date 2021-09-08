@@ -96,56 +96,39 @@ nearest-neighbor search on GPUs.
 
 **Install Options**
 
-GPUMAP can be installed via Conda, PyPi or from source:
+GPUMAP can be installed from source, depencies via pip, preferably in a python 3.7 virtual environment
 
-**Option 1: Conda**
+**Build**
 
-Set up a new conda environment, if needed.
+Make sure cuda and the NVIDIA drivers are present on your system. Tested with Ubuntu 18.04
+x86_46 only (so far). The following repository has been used (added to /etc/apt/sources.list):
 
+.. code:: 
+
+    deb http://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/ /
+    
 .. code:: bash
-
-    conda create -n env
-
-    conda activate env
-
-    conda install python
-
-Install dependecies: Numba and FAISS
-
-.. code:: bash
-
-    conda install numba
-    conda install scikit-learn
-
-    conda install faiss-gpu cudatoolkit=10.0 -c pytorch # For CUDA10
-    # For older CUDA versions:
-    # conda install faiss-gpu cudatoolkit=8.0 -c pytorch # For CUDA8
-    # conda install faiss-gpu cudatoolkit=9.0 -c pytorch # For CUDA9
-
-    conda install -c conda-forge gpumap
-
-**Option 2: PyPi**
-
-GPUMAP is also available as a PyPi package.
-
-.. code:: bash
-
-    pip install scikit-learn numba faiss gpumap
-
-Note that the prebuilt FAISS library is not officially supported by upstream.
-
-**Option 3: Build**
+    sudo apt update
+    sudo apt install cuda cuda-10-0 cuda-10-2
 
 Building from source is easy, clone the repository or get the code onto your
-computer by other means and run the installer with:
+computer by other means, install the 
 
 .. code:: bash
+    pip install --upgrade-pip
+    pip install cupy-cuda102==9.0.0rc1
+    pip install faiss-gpu==1.7.1.post2
+    pip install numpy==1.20.2
+    pip install scikit-learn==0.24.1
+    pip install scipy==1.6.2
 
     python setup.py install
 
-Note that the dependecies need to be installed beforehand. These are
-the `FAISS https://github.com/facebookresearch/faiss/blob/master/INSTALL.md`
-library and `Numba http://numba.pydata.org/numba-doc/latest/user/installing.html`.
+Note that the dependecies need to be installed beforehand. Then test, is the installation
+is working with the script. You will probably get deprecation warnings.
+
+.. code:: bash
+    python test_gpumap.py
 
 -------
 License
