@@ -54,29 +54,9 @@ cause a fallback to the sequential version for parts of the algorithm.
 ------------------------
 Performance and Examples
 ------------------------
+See `https://github.com/p3732/gpumap`.
 
-GPUMAP, like UMAP, is very efficient at embedding large high dimensional
-datasets. In particular it scales well with both input dimension and embedding
-dimension. Performance depends strongly depends on the used GPU. For a problem
-such as the 784-dimensional MNIST digits dataset with 70000 data samples, GPUMAP
-can complete the embedding in around 30 seconds with an (outdated) NVIDIA GTX
-745 graphics card. More recent hardware will scale accordingly. Despite this
-runtime efficiency UMAP still produces high quality embeddings.
-
-The obligatory MNIST digits dataset, embedded in 29 seconds using a 3.6 GHz
-Intel Core i7 processor and an NVIDIA GTX 745 GPU (n_neighbors=10,
-min_dist=0.001):
-
-.. image:: images/gpumap_example_mnist1.png
-    :alt: GPUMAP embedding of MNIST digits
-
-The MNIST digits dataset is fairly straightforward however. A better test is
-the more recent "Fashion MNIST" dataset of images of fashion items (again
-70000 data sample in 784 dimensions). GPUMAP
-produced this embedding in 2 minutes exactly (n_neighbors=5, min_dist=0.1):
-
-.. image:: images/gpumap_example_fashion_mnist1.png
-    :alt: GPUMAP embedding of "Fashion MNIST"
+Testing was done with an RTX2070 and Intel Xeon CPUs.
 
 ----------
 Installing
@@ -141,5 +121,4 @@ licensed.
 Contributing
 ------------
 
-Contributions are always welcome! Fork away!
-
+Contributions, in particular solutions to make GPUMAP compatible with current CUDA version, are highly welcome.
