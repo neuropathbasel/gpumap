@@ -1,0 +1,28 @@
+======
+GPUMAP
+======
+Quick Patch by J. Hench, IfP Basel, Sept 2021, python 3.7
+
+Due to changes in CUDA and cupy, the last version still accepting GPUMAP 0.1.1
+is
+CUDA 10.0/10.2 (coinstalled), cupy: cupy-cuda100==9.0.0rc1
+or cupy-cuda102==9.0.0rc1
+
+To avoid installation of the wrong versions and version pinning at the same time,
+the following requirements have been omitted in the setup.py script to enable
+manual pip installation of compatible versions beforehand:
+
+pip install cupy-cuda102==9.0.0rc1
+pip install faiss-gpu==1.7.1.post2
+pip install numpy==1.20.2
+pip install scikit-learn==0.24.1
+pip install scipy==1.6.2
+
+gpumap is then installed from source:
+cd GPUMAPDIRECTORY
+python setup.py install
+
+The incompatibility boils down to line 142 in gpumap/smooth_knn_dist_gpu.py.
+This has to be fixed if gpumap should work in the future. As of now,
+gpumap can only run with cuda 8 to 10.2, but not 11.x.
+
